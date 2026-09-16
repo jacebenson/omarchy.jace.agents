@@ -7,7 +7,8 @@ its allowance is gone and when the window comes back, and a pay-per-token
 account shows what is left on the meter. One row per subscription, all on
 screen at once.
 
-This is a **clone** of the built-in `omarchy.agents` plugin. `Panel.qml` owns
+This is a **clone** of the built-in `omarchy.agents` plugin — Omarchy's original
+is MIT-licensed, and so is this (see LICENSE). `Panel.qml` owns
 the bar button and the popup; `Main.qml` discovers and watches the records;
 `Agent.qml` is the per-record file watcher. Everything below is specific to the
 clone.
