@@ -578,14 +578,14 @@ def fetch_openai_api_spend() -> tuple[dict[str, Any], str]:
   """
   config = read_json(config_home() / "omarchy" / "agents" / "openai-api.json")
   raw = config.get("fundedAmount")
-  if raw is None or str(raw).strip() == "":
-    return {}, ""
-  try:
-    funded = float(raw)
-  except (TypeError, ValueError):
-    return {}, ""
-  if not math.isfinite(funded):
-    return {}, ""
+  funded: float | None = None
+  if raw is not None and str(raw).strip() != "":
+    try:
+      candidate = float(raw)
+      if math.isfinite(candidate):
+        funded = candidate
+    except (TypeError, ValueError):
+      funded = None
 
   key = openai_admin_key()
   if not key:
@@ -599,9 +599,13 @@ def fetch_openai_api_spend() -> tuple[dict[str, Any], str]:
 
   funded_at = str(config.get("fundedAt") or "").strip()
   try:
-    start = datetime.strptime(funded_at, "%Y-%m-%d").astimezone() if funded_at else datetime.now().astimezone()
+    start = datetime.strptime(funded_at, "%Y-%m-%d").astimezone() if funded_at else None
   except ValueError:
-    start = datetime.now().astimezone()
+    start = None
+  # With no balance to measure against, show what has been spent over a window
+  # worth looking at rather than over the account's whole life.
+  if start is None:
+    start = datetime.now().astimezone() - timedelta(days=90)
 
   try:
     total = openai_costs_total(key, start)
@@ -609,6 +613,22 @@ def fetch_openai_api_spend() -> tuple[dict[str, Any], str]:
     # This card exists only because a balance was configured for it, so a
     # failure to read the spend has to say so rather than leave a bare card.
     return {"usageStatusText": "Unavailable", "authHelpText": f"OpenAI API: {error}"}, ""
+
+  if funded is None:
+    # No balance was supplied, so there is nothing to subtract from. An API key
+    # cannot read the platform's credit balance at all (that endpoint is
+    # session-only), so the bill is the only true figure available — and the
+    # label says which of the two this is.
+    return {
+      "tierLabel": "Spent",
+      "balance": {
+        "remaining": round(total, 2),
+        "funded": 0.0,
+        "spent": round(total, 2),
+        "currency": "USD",
+        "estimated": False,
+      },
+    }, ""
 
   return {"balance": {
     "remaining": round(funded - total, 2),
