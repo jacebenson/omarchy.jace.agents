@@ -114,14 +114,26 @@ Panel {
     return null
   }
 
-  // How many cards share this one's group. With a single card there is nothing
-  // to reorder, so the controls stay out of the way.
-  function groupSize(p) {
-    var rank = p ? usage.providerRank(p) : -1
-    var count = 0
+  // The cards sharing this one's group, in the order they are drawn. A control
+  // that cannot move anything is not shown at all, so this is what decides
+  // whether each direction is offered.
+  function groupSiblings(p) {
+    var siblings = []
+    if (!p) return siblings
+    var rank = usage.providerRank(p)
     for (var i = 0; i < providers.length; i++)
-      if (usage.providerRank(providers[i]) === rank) count++
-    return count
+      if (usage.providerRank(providers[i]) === rank) siblings.push(providers[i])
+    return siblings
+  }
+
+  function canMoveToTop(p) {
+    var siblings = groupSiblings(p)
+    return siblings.length > 1 && siblings[0].providerId !== p.providerId
+  }
+
+  function canMoveToBottom(p) {
+    var siblings = groupSiblings(p)
+    return siblings.length > 1 && siblings[siblings.length - 1].providerId !== p.providerId
   }
 
   // Moving happens inside a group, never across one: the group answers "what
@@ -683,14 +695,20 @@ Panel {
     // a lot of machinery for a list this short, and this needs no tutorial.
     Row {
       id: moveRow
-      visible: root.groupSize(providerDetails.provider) > 1
+      visible: topButton.visible || bottomButton.visible
       width: parent.width
       spacing: Style.spacing.md
 
-      readonly property real cellWidth: (width - spacing) / 2
+      // One button gets the full width; there is no empty half to leave behind.
+      readonly property int visibleCount: (topButton.visible ? 1 : 0) + (bottomButton.visible ? 1 : 0)
+      readonly property real cellWidth: visibleCount > 0
+        ? (width - spacing * (visibleCount - 1)) / visibleCount
+        : 0
 
       Button {
-        width: moveRow.cellWidth
+        id: topButton
+        visible: root.canMoveToTop(providerDetails.provider)
+        width: visible ? moveRow.cellWidth : 0
         text: "Move to top"
         foreground: root.foreground
         fontFamily: root.fontFamily
@@ -700,7 +718,9 @@ Panel {
       }
 
       Button {
-        width: moveRow.cellWidth
+        id: bottomButton
+        visible: root.canMoveToBottom(providerDetails.provider)
+        width: visible ? moveRow.cellWidth : 0
         text: "Move to bottom"
         foreground: root.foreground
         fontFamily: root.fontFamily
