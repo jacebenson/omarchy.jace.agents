@@ -1011,7 +1011,8 @@ def set_funded(provider_id: str, raw_amount: str) -> int:
   except ValueError:
     print(f"omarchy-agent-usage-opencode: {raw_amount!r} is not a number", file=sys.stderr)
     return 2
-  if not math.isfinite(amount) or amount < 0:
+  # Below zero is allowed on purpose: an overdrawn balance is a real reading.
+  if not math.isfinite(amount):
     print(f"omarchy-agent-usage-opencode: {raw_amount!r} is not a usable amount", file=sys.stderr)
     return 2
 
@@ -1084,11 +1085,17 @@ def estimate_balance(card_id: str, stats: dict[str, Any]) -> dict[str, Any] | No
   keeps the number from double-subtracting a top-up.
   """
   config = read_json(config_home() / "omarchy" / "agents" / f"{card_id}.json")
+  raw = config.get("fundedAmount")
+  # An absent figure means nobody has told us the balance. Zero or below is a
+  # real reading — an overdrawn prepaid account is exactly the case worth
+  # showing.
+  if raw is None or str(raw).strip() == "":
+    return None
   try:
-    funded = float(config.get("fundedAmount") or 0)
+    funded = float(raw)
   except (TypeError, ValueError):
     return None
-  if not math.isfinite(funded) or funded <= 0:
+  if not math.isfinite(funded):
     return None
 
   funded_at = str(config.get("fundedAt") or "").strip()

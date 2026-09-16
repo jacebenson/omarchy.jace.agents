@@ -622,7 +622,8 @@ Panel {
 
     function commitFunded(text) {
       var amount = Number(String(text || "").trim())
-      if (!isFinite(amount) || amount < 0) return
+      // A negative reading is valid: an overdrawn prepaid account is a thing.
+      if (!isFinite(amount)) return
       root.saveFundedAmount(provider ? provider.providerId : "", amount.toFixed(2))
     }
 
@@ -682,7 +683,7 @@ Panel {
         textFormat: Text.PlainText
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
-        text: root.fundedError !== "" ? root.fundedError : "Funded"
+        text: root.fundedError !== "" ? root.fundedError : "Balance"
         color: root.fundedError !== "" ? root.urgent : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -697,14 +698,16 @@ Panel {
         anchors.right: fundedSave.left
         anchors.rightMargin: Style.space(6)
         anchors.verticalCenter: parent.verticalCenter
-        placeholderText: "total put in, e.g. 20.00"
+        placeholderText: "balance you can see, e.g. 3.77"
         foreground: root.foreground
         font.family: root.fontFamily
         verticalPadding: Style.space(4)
         // Standard notation in the C locale: money is written "20.00", not
         // "20,00", whatever the desktop's locale says.
         validator: DoubleValidator {
-          bottom: 0
+          // A balance can legitimately read below zero: that is what overdrawn
+          // looks like, and it is worth being able to type it in.
+          bottom: -1000000
           top: 1000000
           decimals: 2
           locale: "C"
