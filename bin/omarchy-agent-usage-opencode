@@ -1,0 +1,968 @@
+#!/usr/bin/python3
+# omarchy:summary=Print every opencode subscription's usage record as JSON
+# omarchy:args=[--force] [--limits-only] [--except <card>] [card...]
+# omarchy:hidden=true
+"""Collect every subscription opencode has seen into one record per card.
+
+opencode is where the subscriptions are actually spent, and it keeps its own
+books: every session names the providerID and model it ran on, and every
+finished step records its tokens. So one pass over its database covers every
+provider at once, and a new subscription needs no code change — a providerID
+that starts appearing simply becomes a card.
+
+The output is a JSON object of card id to record. The wrapper script that
+calls this splits it into one <card>.json per card in the usage directory the
+agents panel watches.
+
+Two tables carry the numbers, and neither is the 8.9 GB `message` table the
+upstream claude/codex collectors walk:
+
+  session_v2       one row per session, its model as {"id","providerID"} JSON
+  part             one row per streamed part; type "step-finish" carries that
+                   step's tokens and the local timestamp that dates it
+  session_message  one row per conversation entry; type "user" is a prompt
+
+The `message` table is deliberately ignored: it has no index on its provider,
+so filtering it means parsing every blob in the database, and its providerID
+is null on everything written before opencode recorded the field, so it adds
+nothing the session model does not already say.
+
+Model attribution follows the session's model. opencode records the model on
+the session, not on each step, so a session that switched models halfway
+counts all of its tokens toward the model it ended on.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
+OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
+OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+# The ChatGPT backend reports a Codex subscription's two rolling windows as the
+# share already used, with a unix reset timestamp each.
+CODEX_WINDOWS = (
+  ("primary_window", "5-hour"),
+  ("secondary_window", "Weekly (7-day)"),
+)
+
+# opencode asks every client to identify itself instead of arriving as a
+# generic HTTP library.
+USER_AGENT = "omarchy-agents/1.0"
+
+# opencode's Go subscription reports three rolling windows as the share of the
+# plan allowance already spent. The labels are what the panel turns into "5h",
+# "7d", and "30d".
+GO_WINDOWS = (
+  ("rolling", "5-hour"),
+  ("weekly", "Weekly (7-day)"),
+  ("monthly", "Monthly (30-day)"),
+)
+
+# Reuse windows mirror the codex collector. A normal run only needs to dedup
+# concurrent collectors; --limits-only promises fresh limits, not a fresh walk
+# of a very large database, so it may reuse a scan for far longer. --force
+# always rescans.
+SCAN_REUSE_SECONDS = 20
+LIMITS_ONLY_REUSE_SECONDS = 900
+
+# providerID -> card. These are only the display name and whether the account
+# is prepaid; the numbers always come from opencode's own accounting.
+CARD_DEFAULTS = {
+  "deepseek": {"name": "DeepSeek", "tierLabel": "Prepaid"},
+  "opencode-go": {"name": "OpenCode", "tierLabel": "Go + Zen"},
+  "codex": {"name": "Codex", "tierLabel": "Subscription"},
+  "github-copilot": {"name": "GitHub Copilot", "tierLabel": "Subscription"},
+  "openrouter": {"name": "OpenRouter", "tierLabel": "Prepaid"},
+  "replicate": {"name": "Replicate", "tierLabel": "Prepaid"},
+}
+
+# A card can be fed by more than one providerID, and a config entry may fold
+# them with "id".
+
+# Already covered by an upstream collector. Fireworks has its own billing-API
+# collector and its own record; Anthropic is counted from its native CLI
+# sessions by the claude collector. Emitting them here too would show every one
+# of those tokens twice. OpenAI is NOT in this list: the codex card is built
+# here from opencode's `openai` sessions and the ChatGPT backend's windows, and
+# the wrapper tells the upstream codex collector to stand down so the two never
+# write the same file.
+UPSTREAM_PROVIDER_IDS = {"fireworks-ai", "anthropic"}
+
+# providerIDs that are really another card's account. opencode's `openai`
+# providerID is the Codex subscription, so its sessions land on the codex card.
+# Zen folds onto the Go card because they are one product to a user: Go is a
+# subscription with rolling windows, Zen is a credit balance with no API at
+# all, and a row that can only ever say "balance unavailable" is noise.
+CARD_FOLDS = {"openai": "codex", "opencode": "opencode-go"}
+
+# Local endpoints and free tiers: nothing to subscribe to, nothing to track.
+# Replicate is NOT here: it is a paid account with no usage API, and the panel
+# wants it listed so its mark can link to the billing page.
+IGNORED_PROVIDER_IDS: set[str] = set()
+IGNORED_PROVIDER_PREFIXES = ("ollama", "localhost", "lmstudio", "llamacpp", "vllm")
+
+STEP_PART_SQL = (
+  "SELECT session_id, data, time_created FROM part"
+  " WHERE data LIKE '%\"step-finish\"%'"
+  " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.type') END = 'step-finish'"
+)
+
+PROMPT_SQL = "SELECT session_id, time_created FROM session_message WHERE type = 'user'"
+
+class OpencodeError(Exception):
+  pass
+
+
+# ------------------------------------------------------------------- helpers
+
+
+def number(value: Any) -> int:
+  try:
+    return max(0, round(float(value or 0)))
+  except (TypeError, ValueError):
+    return 0
+
+
+def empty_bucket() -> dict[str, int]:
+  return {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+  }
+
+
+def blank_stats(dates: list[str]) -> dict[str, Any]:
+  # Every card needs its own dicts and sets: a shared template would make the
+  # first provider's tokens show up on all of them.
+  return {
+    "todayPrompts": 0,
+    "todaySessionIds": set(),
+    "todayTotalTokens": 0,
+    "todayTokensByModel": {},
+    "recentByDay": {day: 0 for day in dates},
+    "modelUsage": {},
+    "totalSteps": 0,
+    "sessionIds": set(),
+    "prompts": 0,
+    "activeDates": set(),
+  }
+
+
+def data_home() -> Path:
+  return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+
+
+def config_home() -> Path:
+  return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+
+
+def cache_home() -> Path:
+  return Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+
+
+def database_path() -> Path:
+  return data_home() / "opencode" / "opencode.db"
+
+
+def auth_path() -> Path:
+  return data_home() / "opencode" / "auth.json"
+
+
+def card_config_path() -> Path:
+  return config_home() / "omarchy" / "agents" / "opencode.json"
+
+
+def usage_dir() -> Path:
+  return Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")) / "omarchy" / "agents" / "usage"
+
+
+def read_json(path: Path) -> dict[str, Any]:
+  try:
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+  except (OSError, json.JSONDecodeError):
+    return {}
+  return parsed if isinstance(parsed, dict) else {}
+
+
+def item_config(path: Path) -> dict[str, Any]:
+  entry = read_json(path)
+  return entry if isinstance(entry, dict) else {}
+
+
+def local_date(ms: Any) -> str:
+  # Timestamps are epoch milliseconds. A missing or nonsense one falls back to
+  # today rather than dropping the usage: a wrong day beats a vanished step.
+  try:
+    stamp = int(ms)
+  except (TypeError, ValueError):
+    stamp = 0
+  if stamp <= 0:
+    return datetime.now().strftime("%Y-%m-%d")
+  if stamp > 10_000_000_000:
+    stamp = stamp / 1000
+  return datetime.fromtimestamp(stamp).strftime("%Y-%m-%d")
+
+
+def recent_dates(today: str) -> list[str]:
+  base = datetime.strptime(today, "%Y-%m-%d")
+  return [(base - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+
+
+def model_key(raw: Any) -> str:
+  # Model ids arrive namespaced and hyphenated: openrouter sends
+  # "deepseek/deepseek-v4-flash", Fireworks "accounts/acct/models/kimi-k2p5".
+  # Take the last segment and rejoin a version split across a "p" so the panel
+  # shows one row per model instead of three.
+  name = str(raw or "").rstrip("/").split("/")[-1] or "unknown"
+  return re.sub(r"(?<=\d)p(?=\d)", ".", name)
+
+
+def model_field(raw: Any, field: str) -> str:
+  if not raw:
+    return ""
+  try:
+    parsed = json.loads(raw)
+  except (TypeError, ValueError):
+    return ""
+  if not isinstance(parsed, dict):
+    return ""
+  return str(parsed.get(field) or "")
+
+
+# ---------------------------------------------------------------- card lookup
+
+
+def card_map() -> tuple[dict[str, dict[str, Any]], set[str]]:
+  """providerID -> card description, plus the cards switched off.
+
+  The overrides live in ~/.config/omarchy/agents/opencode.json so a provider
+  that does not deserve its own card can be dropped or renamed, and a provider
+  that is normally covered upstream can be adopted here, without touching this
+  script:
+
+    {
+      "providers": {
+        "replicate": { "name": "Replicate", "tierLabel": "Prepaid" },
+        "openrouter": { "enabled": false }
+      }
+    }
+  """
+  cards: dict[str, dict[str, Any]] = {}
+  overridden: set[str] = set()
+
+  for provider_id, card in CARD_DEFAULTS.items():
+    cards[provider_id] = dict(card, id=provider_id)
+
+  for provider_id, card_id in CARD_FOLDS.items():
+    if card_id in cards:
+      cards[provider_id] = dict(cards[card_id])
+
+  disabled: set[str] = set()
+  config = read_json(card_config_path())
+  overrides = config.get("providers")
+  if isinstance(overrides, dict):
+    for provider_id, raw_entry in overrides.items():
+      provider_id = str(provider_id)
+      entry = raw_entry if isinstance(raw_entry, dict) else {}
+      overridden.add(provider_id)
+      base = dict(cards.get(provider_id) or {"id": provider_id, "name": provider_id, "tierLabel": "Subscription"})
+      base.update({key: value for key, value in entry.items() if key in ("id", "name", "tierLabel")})
+      cards[provider_id] = base
+      if entry.get("enabled") is False:
+        disabled.add(str(base.get("id") or provider_id))
+
+  return cards, disabled
+
+
+def is_tracked(provider_id: str, cards: dict[str, dict[str, Any]]) -> bool:
+  # An explicit entry in the config is the user saying they want this one, so
+  # it wins over the upstream and local-endpoint defaults.
+  if provider_id in cards:
+    return True
+  if provider_id in UPSTREAM_PROVIDER_IDS or provider_id in IGNORED_PROVIDER_IDS:
+    return False
+  for prefix in IGNORED_PROVIDER_PREFIXES:
+    if provider_id.startswith(prefix):
+      return False
+  return True
+
+
+# ---------------------------------------------------------------------- scan
+
+
+def scan_database(today: str, cards: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+  """Per-provider stats from opencode's own tables, or {} when there is none."""
+  db = database_path()
+  if not db.is_file():
+    return {}
+
+  dates = recent_dates(today)
+  providers: dict[str, str] = {}   # session id -> providerID
+  models: dict[str, str] = {}      # session id -> model id
+  totals: dict[str, dict[str, Any]] = {}
+
+  def provider_card(provider_id: str) -> dict[str, Any]:
+    if provider_id not in totals:
+      totals[provider_id] = blank_stats(dates)
+    return totals[provider_id]
+
+  try:
+    # Read-only: opencode may be writing right now, and the collector must
+    # never take the editor down with it.
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+  except sqlite3.Error:
+    return {}
+  try:
+    conn.execute("PRAGMA query_only = ON")
+
+    # session_v2 is the current table; `session` is the older one kept for
+    # databases written before the column existed. The handful of sessions null
+    # in both predate opencode recording a model at all, so their tokens stay
+    # unattributed rather than being guessed at.
+    for table in ("session_v2", "session"):
+      try:
+        for session_id, model in conn.execute(f"SELECT id, model FROM {table}"):
+          if not model or session_id in providers:
+            continue
+          provider_id = model_field(model, "providerID")
+          if provider_id:
+            providers[session_id] = provider_id
+            models[session_id] = model_field(model, "id")
+      except sqlite3.Error:
+        continue
+
+    for session_id, raw, created in conn.execute(STEP_PART_SQL):
+      provider_id = providers.get(session_id)
+      if not provider_id or not is_tracked(provider_id, cards):
+        continue
+      try:
+        entry = json.loads(raw)
+        if not isinstance(entry, dict) or entry.get("type") != "step-finish":
+          continue
+        tokens = entry.get("tokens") or {}
+        cache = tokens.get("cache") or {}
+        input_tokens = number(tokens.get("input"))
+        # opencode keeps thinking tokens out of output; both are generated.
+        output_tokens = number(tokens.get("output")) + number(tokens.get("reasoning"))
+        cache_read = number(cache.get("read"))
+        cache_write = number(cache.get("write"))
+        total = input_tokens + output_tokens + cache_read + cache_write
+        if total <= 0:
+          continue
+      except Exception:
+        continue
+
+      day = local_date(created)
+      model = model_key(models.get(session_id)) or "unknown"
+      stats = provider_card(provider_id)
+      stats["totalSteps"] += 1
+      stats["sessionIds"].add(session_id)
+      stats["activeDates"].add(day)
+
+      bucket = stats["modelUsage"].setdefault(model, empty_bucket())
+      bucket["inputTokens"] += input_tokens
+      bucket["outputTokens"] += output_tokens
+      bucket["cacheReadInputTokens"] += cache_read
+      bucket["cacheCreationInputTokens"] += cache_write
+
+      if day in stats["recentByDay"]:
+        stats["recentByDay"][day] += total
+      if day == today:
+        stats["todayTotalTokens"] += total
+        stats["todaySessionIds"].add(session_id)
+        stats["todayTokensByModel"][model] = stats["todayTokensByModel"].get(model, 0) + total
+
+    for session_id, created in conn.execute(PROMPT_SQL):
+      provider_id = providers.get(session_id)
+      if not provider_id or not is_tracked(provider_id, cards):
+        continue
+      day = local_date(created)
+      stats = provider_card(provider_id)
+      stats["prompts"] += 1
+      stats["sessionIds"].add(session_id)
+      stats["activeDates"].add(day)
+      if day == today:
+        stats["todayPrompts"] += 1
+        stats["todaySessionIds"].add(session_id)
+  except sqlite3.Error as error:
+    print(f"omarchy-agent-usage-opencode: database scan incomplete ({error})", file=sys.stderr)
+  finally:
+    conn.close()
+
+  return totals
+
+
+# -------------------------------------------------------------------- balance
+
+
+def read_key(provider_id: str, env_var: str, config_name: str) -> str:
+  env = str(os.environ.get(env_var, "")).strip()
+  if env:
+    return env
+  configured = str(item_config(config_home() / "omarchy" / "agents" / f"{config_name}.json").get("apiKey") or "").strip()
+  if configured:
+    return configured
+  entry = read_json(auth_path()).get(provider_id)
+  return str(entry.get("key") or "").strip() if isinstance(entry, dict) else ""
+
+
+def fetch_deepseek() -> tuple[dict[str, Any], str]:
+  """The live prepaid ledger, plus a status line when it cannot be read.
+
+  Unlike Fireworks, DeepSeek publishes an ordinary balance endpoint that a
+  normal API key can read, so this figure is authoritative rather than an
+  estimate.
+  """
+  key = read_key("deepseek", "DEEPSEEK_API_KEY", "deepseek")
+  if not key:
+    return {}, "Set DEEPSEEK_API_KEY or sign in to DeepSeek in opencode."
+
+  payload = get_json(DEEPSEEK_BALANCE_URL, key)
+  infos = payload.get("balance_infos") if isinstance(payload, dict) else None
+  if not isinstance(infos, list):
+    return {}, "DeepSeek returned no balance information"
+
+  # Prefer the account's USD ledger; fall back to whatever currency it has.
+  chosen = None
+  for info in infos:
+    if not isinstance(info, dict):
+      continue
+    if str(info.get("currency") or "").upper() == "USD":
+      chosen = info
+      break
+    if chosen is None:
+      chosen = info
+  if chosen is None:
+    return {}, "DeepSeek returned no balance information"
+
+  def amount(field: str) -> float:
+    try:
+      return max(0.0, float(chosen.get(field) or 0))
+    except (TypeError, ValueError):
+      return 0.0
+
+  remaining = amount("total_balance")
+  funded = amount("topped_up_balance") + amount("granted_balance")
+  return {"balance": {
+    "remaining": remaining,
+    "funded": funded,
+    "spent": max(0.0, funded - remaining),
+    "currency": str(chosen.get("currency") or "USD"),
+    "estimated": False,
+  }}, ""
+
+
+def fetch_openrouter() -> tuple[dict[str, Any], str]:
+  """Credits purchased minus credits spent, which OpenRouter reports directly."""
+  key = read_key("openrouter", "OPENROUTER_API_KEY", "openrouter")
+  if not key:
+    return {}, "Set OPENROUTER_API_KEY or sign in to OpenRouter in opencode."
+
+  payload = get_json(OPENROUTER_CREDITS_URL, key)
+  data = payload.get("data") if isinstance(payload, dict) else None
+  if not isinstance(data, dict):
+    return {}, "OpenRouter returned no credit information"
+
+  def amount(field: str) -> float:
+    try:
+      return max(0.0, float(data.get(field) or 0))
+    except (TypeError, ValueError):
+      return 0.0
+
+  funded = amount("total_credits")
+  spent = amount("total_usage")
+  if funded <= 0:
+    return {}, ""
+  return {"balance": {
+    "remaining": max(0.0, funded - spent),
+    "funded": funded,
+    "spent": spent,
+    "currency": "USD",
+    "estimated": False,
+  }}, ""
+
+
+def fetch_opencode_go_limits() -> tuple[dict[str, Any], str]:
+  """The Go subscription's rolling windows, as percentages of its allowance.
+
+  opencode exposes this endpoint for Go only. Zen is a pay-per-token balance
+  with no API at all — opencode's own feature request (#10448) is still open —
+  so Zen can report what it has spent but not what is left.
+  """
+  key = read_key("opencode-go", "OPENCODE_GO_API_KEY", "opencode-go")
+  if not key:
+    return {}, "Set OPENCODE_GO_API_KEY or sign in to OpenCode Go in opencode."
+
+  payload = get_json(OPENCODE_GO_USAGE_URL, key)
+  usage = payload.get("usage") if isinstance(payload, dict) else None
+  if not isinstance(usage, dict):
+    return {}, "OpenCode Go returned no usage information"
+
+  limits = []
+  for field, label in GO_WINDOWS:
+    entry = usage.get(field)
+    if not isinstance(entry, dict):
+      continue
+    try:
+      # The API reports the share of the allowance already spent, 0-100.
+      percent = max(0.0, min(100.0, float(entry.get("percent") or 0))) / 100.0
+    except (TypeError, ValueError):
+      continue
+    limits.append({
+      "label": label,
+      "percent": percent,
+      "resetsAt": str(entry.get("resetsAt") or ""),
+    })
+  if not limits:
+    return {}, "OpenCode Go returned no usage windows"
+  return {"limits": limits}, ""
+
+
+def get_json(url: str, key: str, account_id: str = "") -> dict[str, Any]:
+  # opencode asks clients to identify themselves, and Cloudflare in front of
+  # opencode.ai answers a bare Python-urllib user agent with 403 before the key
+  # is ever checked.
+  headers = {
+    "Authorization": "Bearer " + key,
+    "Accept": "application/json",
+    "User-Agent": USER_AGENT,
+  }
+  # The ChatGPT backend wants to know which account the token speaks for.
+  if account_id:
+    headers["chatgpt-account-id"] = account_id
+  request = urllib.request.Request(url, headers=headers)
+  try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+      payload = json.load(response)
+  except urllib.error.HTTPError as error:
+    if error.code == 401:
+      raise OpencodeError("the API key was rejected") from error
+    if error.code == 403:
+      raise OpencodeError("the API refused the request") from error
+    if error.code == 404:
+      raise OpencodeError("the endpoint does not exist for this account") from error
+    raise OpencodeError(f"the API returned HTTP {error.code}") from error
+  except urllib.error.URLError as error:
+    raise OpencodeError("the API could not be reached") from error
+  except (json.JSONDecodeError, TimeoutError) as error:
+    raise OpencodeError("the API returned an invalid response") from error
+  return payload if isinstance(payload, dict) else {}
+
+
+def openai_oauth() -> tuple[str, str]:
+  """The ChatGPT access token and account id opencode is signed in with.
+
+  Connecting Codex in opencode's TUI stores an OAuth credential in opencode's
+  own database, not in ~/.codex, so a machine can have a working Codex
+  subscription and still look logged out to the Codex CLI.
+  """
+  db = database_path()
+  if db.is_file():
+    conn = None
+    try:
+      conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+      conn = None
+    if conn is not None:
+      try:
+        row = conn.execute(
+          "SELECT value FROM credential WHERE integration_id = 'openai'"
+          " ORDER BY time_updated DESC LIMIT 1"
+        ).fetchone()
+      except sqlite3.Error:
+        row = None
+      finally:
+        conn.close()
+      if row:
+        try:
+          credential = json.loads(row[0])
+        except (TypeError, ValueError):
+          credential = {}
+        if isinstance(credential, dict):
+          access = str(credential.get("access") or "").strip()
+          metadata = credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {}
+          if access:
+            return access, str(metadata.get("accountID") or "").strip()
+
+  # A `codex login` on this machine is the same account by another door.
+  auth = read_json(Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "auth.json")
+  tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+  return str(tokens.get("access_token") or "").strip(), str(tokens.get("account_id") or "").strip()
+
+
+def fetch_codex_limits() -> tuple[dict[str, Any], str]:
+  """The Codex subscription's rolling windows, for either sign-in."""
+  access, account = openai_oauth()
+  if not access:
+    return {}, "Connect Codex in opencode, or run `codex login`, to read its limits."
+
+  payload = get_json(CHATGPT_USAGE_URL, access, account)
+  rate = payload.get("rate_limit") if isinstance(payload, dict) else None
+  if not isinstance(rate, dict):
+    return {}, "Codex returned no rate limit information"
+
+  limits = []
+  for field, label in CODEX_WINDOWS:
+    window = rate.get(field)
+    if not isinstance(window, dict):
+      continue
+    try:
+      percent = max(0.0, min(100.0, float(window.get("used_percent") or 0))) / 100.0
+    except (TypeError, ValueError):
+      continue
+    reset = number(window.get("reset_at"))
+    limits.append({
+      "label": label,
+      "percent": percent,
+      "resetsAt": datetime.fromtimestamp(reset, timezone.utc).isoformat() if reset > 0 else "",
+    })
+  if not limits:
+    return {}, "Codex reported no usage windows"
+
+  overrides: dict[str, Any] = {"limits": limits}
+  plan = str(payload.get("plan_type") or "").strip()
+  if plan:
+    overrides["tierLabel"] = plan.capitalize()
+  return overrides, ""
+
+
+# What each card is worth beyond its opencode session history. A funded key or
+# a live subscription earns a card even on a machine that has never run a
+# session through opencode for it.
+REMOTE_FETCHERS = {
+  "deepseek": fetch_deepseek,
+  "openrouter": fetch_openrouter,
+  "opencode-go": fetch_opencode_go_limits,
+  "codex": fetch_codex_limits,
+}
+
+
+# ---------------------------------------------------------------------- cache
+
+
+def cache_paths() -> tuple[Path, Path]:
+  digest = hashlib.sha1(str(database_path()).encode("utf-8")).hexdigest()[:16]
+  root = cache_home() / "omarchy" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root / f"opencode-scan-{digest}.json", root / f"opencode-scan-{digest}.lock"
+
+
+def read_fresh_json(path: Path, max_age_seconds: float) -> Any | None:
+  if max_age_seconds <= 0 or not path.exists():
+    return None
+  try:
+    # A negative age means the mtime is in the future: the clock moved
+    # backwards since the write, so the cache's freshness cannot be trusted.
+    age = time.time() - path.stat().st_mtime
+    if 0 <= age <= max_age_seconds:
+      return json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return None
+  return None
+
+
+def write_json(path: Path, payload: Any) -> None:
+  handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    tmp.chmod(0o644)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+
+
+def serialize_stats(stats: dict[str, Any]) -> dict[str, Any]:
+  out = {}
+  for provider_id, entry in stats.items():
+    out[provider_id] = {
+      **{key: value for key, value in entry.items() if key != "sessionIds" and key != "todaySessionIds" and key != "activeDates"},
+      "sessionIds": sorted(entry["sessionIds"]),
+      "todaySessionIds": sorted(entry["todaySessionIds"]),
+      "activeDates": sorted(entry["activeDates"]),
+    }
+  return out
+
+
+def deserialize_stats(cached: Any) -> dict[str, Any]:
+  # Sets do not survive JSON, and the direct-scan path hands over live sets, so
+  # this normalizes both shapes into the one the records are built from.
+  out: dict[str, Any] = {}
+  if not isinstance(cached, dict):
+    return out
+  for provider_id, entry in cached.items():
+    if not isinstance(entry, dict):
+      continue
+    out[provider_id] = {
+      **entry,
+      "sessionIds": set(entry.get("sessionIds") or []),
+      "todaySessionIds": set(entry.get("todaySessionIds") or []),
+      "activeDates": set(entry.get("activeDates") or []),
+      "recentByDay": entry.get("recentByDay") or {},
+      "todayTokensByModel": entry.get("todayTokensByModel") or {},
+      "modelUsage": entry.get("modelUsage") or {},
+      "totalSteps": number(entry.get("totalSteps")),
+      "prompts": number(entry.get("prompts")),
+      "todayPrompts": number(entry.get("todayPrompts")),
+      "todayTotalTokens": number(entry.get("todayTotalTokens")),
+    }
+  return out
+
+
+def cached_scan(today: str, max_age: float, cards: dict[str, dict[str, Any]]) -> dict[str, Any]:
+  """The scan, with the cache as a pure optimization.
+
+  Any cache-layer failure degrades to a direct scan: the records are the
+  contract, the cache is not.
+  """
+  cache_file, lock_file = cache_paths()
+
+  def fresh() -> dict[str, Any] | None:
+    cached = read_fresh_json(cache_file, max_age)
+    if not isinstance(cached, dict) or cached.get("schemaVersion") != SCHEMA_VERSION:
+      return None
+    # today* fields only mean "today" on the day they were scanned, whatever
+    # the mtime says. A cache from yesterday is a miss, not merely old.
+    if cached.get("scanDate") != today:
+      return None
+    return deserialize_stats(cached.get("byProvider"))
+
+  cached = fresh()
+  if cached is not None:
+    return cached
+
+  try:
+    with lock_file.open("w") as lock:
+      fcntl.flock(lock, fcntl.LOCK_EX)
+      cached = fresh()
+      if cached is not None:
+        return cached
+      stats = scan_database(today, cards)
+      try:
+        write_json(cache_file, {
+          "schemaVersion": SCHEMA_VERSION,
+          "scanDate": today,
+          "byProvider": serialize_stats(stats),
+        })
+      except Exception as error:
+        print(f"omarchy-agent-usage-opencode: could not write scan cache ({error})", file=sys.stderr)
+      return deserialize_stats(stats)
+  except Exception as error:
+    print(f"omarchy-agent-usage-opencode: cache unavailable ({error}); scanning directly", file=sys.stderr)
+    return deserialize_stats(scan_database(today, cards))
+
+
+# ------------------------------------------------------------------- records
+
+
+def merge_stats(entries: list[dict[str, Any]], dates: list[str]) -> dict[str, Any]:
+  merged = blank_stats(dates)
+  for entry in entries:
+    merged["todayPrompts"] += number(entry.get("todayPrompts"))
+    merged["todayTotalTokens"] += number(entry.get("todayTotalTokens"))
+    merged["prompts"] += number(entry.get("prompts"))
+    merged["totalSteps"] += number(entry.get("totalSteps"))
+    merged["sessionIds"] |= set(entry.get("sessionIds") or [])
+    merged["todaySessionIds"] |= set(entry.get("todaySessionIds") or [])
+    merged["activeDates"] |= set(entry.get("activeDates") or [])
+    for model, tokens in (entry.get("todayTokensByModel") or {}).items():
+      merged["todayTokensByModel"][model] = merged["todayTokensByModel"].get(model, 0) + number(tokens)
+    for day, tokens in (entry.get("recentByDay") or {}).items():
+      merged["recentByDay"][day] = merged["recentByDay"].get(day, 0) + number(tokens)
+    for model, bucket in (entry.get("modelUsage") or {}).items():
+      target = merged["modelUsage"].setdefault(model, empty_bucket())
+      for key in target:
+        target[key] += number((bucket or {}).get(key))
+  return merged
+
+
+def record_from_stats(card_id: str, name: str, tier_label: str, stats: dict[str, Any], dates: list[str]) -> dict[str, Any]:
+  active_dates = sorted(str(day) for day in stats["activeDates"])
+  # A card that exists only for its balance has no week to draw; an all-zero
+  # seven-day chart would read as a quiet week rather than a missing one.
+  days = dates if stats["totalSteps"] or stats["prompts"] else []
+
+  return {
+    "schemaVersion": 1,
+    "id": card_id,
+    "name": name,
+    "updatedAt": datetime.now().astimezone().isoformat(),
+    "ready": True,
+    "hasLocalStats": True,
+    "hasPromptStats": True,
+    # opencode's numbers are this machine's sessions, so they add up across
+    # synced devices the way every other local-stats agent does.
+    "scope": "device",
+    "tierLabel": tier_label,
+    "usageStatusText": "",
+    "authHelpText": "",
+    "limits": [],
+    "todayPrompts": number(stats["todayPrompts"]),
+    "todaySessions": len(stats["todaySessionIds"]),
+    "todayTotalTokens": number(stats["todayTotalTokens"]),
+    "todayTokensByModel": stats["todayTokensByModel"],
+    "recentDays": [{"date": day, "messageCount": number(stats["recentByDay"].get(day))} for day in days],
+    "totalPrompts": number(stats["prompts"]),
+    "totalSessions": len(stats["sessionIds"]),
+    "activeDays": len(active_dates),
+    "activeDates": active_dates,
+    "modelUsage": stats["modelUsage"],
+  }
+
+
+def wanted(card_id: str, only: list[str], excluded: set[str]) -> bool:
+  if card_id in excluded:
+    return False
+  return card_id in only if only else True
+
+
+def build_records(stats: dict[str, Any], dates: list[str], only: list[str], excluded: set[str],
+                  cards: dict[str, dict[str, Any]], disabled: set[str]) -> dict[str, Any]:
+  records: dict[str, Any] = {}
+
+  # One card can be fed by several providerIDs (opencode zen and go), so gather
+  # the providerIDs that share a card before building its record.
+  providers_by_card: dict[str, list[str]] = {}
+  for provider_id in stats:
+    card_id = str(cards.get(provider_id, {}).get("id") or provider_id)
+    if card_id in disabled or not wanted(card_id, only, excluded):
+      continue
+    providers_by_card.setdefault(card_id, []).append(provider_id)
+
+  for card_id, provider_ids in providers_by_card.items():
+    description = cards.get(provider_ids[0], {})
+    entries = [stats[provider_id] for provider_id in provider_ids]
+    records[card_id] = record_from_stats(
+      card_id,
+      str(description.get("name") or card_id),
+      str(description.get("tierLabel") or "Subscription"),
+      entries[0] if len(entries) == 1 else merge_stats(entries, dates),
+      dates,
+    )
+
+  # A balance or a set of rolling windows is the only number here that does not
+  # come from opencode, and either one is worth a card even when opencode has
+  # never run a session for that provider. A provider with neither usage nor a
+  # readable remote figure is left out entirely rather than shown as an empty
+  # row.
+  for card_id, fetch in REMOTE_FETCHERS.items():
+    if card_id in disabled or not wanted(card_id, only, excluded):
+      continue
+    try:
+      overrides, status = fetch()
+    except OpencodeError as error:
+      overrides, status = {}, f"{_remote_name(cards, card_id)}: {error}"
+    if not overrides and card_id not in records:
+      continue
+    if card_id not in records:
+      description = cards.get(card_id, {})
+      records[card_id] = record_from_stats(
+        card_id,
+        str(description.get("name") or card_id),
+        str(description.get("tierLabel") or "Prepaid"),
+        blank_stats(dates),
+        dates,
+      )
+    records[card_id].update(overrides)
+    if not overrides and status:
+      records[card_id]["usageStatusText"] = "Unavailable"
+      records[card_id]["authHelpText"] = status
+
+  # Every card that is switched on gets a record even when it has nothing to
+  # report yet. A provider we can spend money on but not read collapses to a
+  # linked button on the panel side, and a button needs a record to exist — so
+  # "no figures" has to be an emitted record, not a missing one.
+  for provider_id, description in cards.items():
+    card_id = str(description.get("id") or provider_id)
+    # Folded ids are covered by the card they fold onto.
+    if card_id != provider_id or card_id in records or card_id in disabled:
+      continue
+    if not wanted(card_id, only, excluded):
+      continue
+    records[card_id] = record_from_stats(
+      card_id,
+      str(description.get("name") or card_id),
+      str(description.get("tierLabel") or "Subscription"),
+      blank_stats(dates),
+      dates,
+    )
+
+  return records
+
+
+def _remote_name(cards: dict[str, dict[str, Any]], card_id: str) -> str:
+  return str(cards.get(card_id, {}).get("name") or card_id)
+
+
+# ----------------------------------------------------------------------- main
+
+
+def prune_folded_records(cards: dict[str, dict[str, Any]]) -> None:
+  """Delete records left behind by a fold.
+
+  Folding re-homes a providerID's sessions onto another card, so the record
+  written under the old name is orphaned — and the panel would draw it as a
+  second, empty row, because a record nobody configured is still a provider it
+  has to show. Only folded ids are pruned; every other record in this directory
+  belongs to a collector that is not this one.
+  """
+  for provider_id, card_id in CARD_FOLDS.items():
+    if provider_id == card_id or cards.get(provider_id, {}).get("id") != card_id:
+      continue
+    try:
+      (usage_dir() / f"{provider_id}.json").unlink(missing_ok=True)
+    except OSError:
+      pass
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description="Print every opencode subscription's usage record as JSON")
+  parser.add_argument("--force", action="store_true")
+  parser.add_argument("--limits-only", action="store_true")
+  parser.add_argument("--except", action="append", default=[], dest="excluded")
+  parser.add_argument("cards", nargs="*")
+  args = parser.parse_args()
+
+  only = [str(card) for card in args.cards if str(card)]
+  excluded = {str(card) for card in args.excluded}
+  max_age = 0 if args.force else (LIMITS_ONLY_REUSE_SECONDS if args.limits_only else SCAN_REUSE_SECONDS)
+
+  today = datetime.now().strftime("%Y-%m-%d")
+  try:
+    cards, disabled = card_map()
+    prune_folded_records(cards)
+    stats = cached_scan(today, max_age, cards)
+    records = build_records(stats, recent_dates(today), only, excluded, cards, disabled)
+  except Exception as error:
+    # One record per card is the contract, so a failure here still prints an
+    # object — an empty one — instead of leaving stale records on disk.
+    print(f"omarchy-agent-usage-opencode: {type(error).__name__}: {error}", file=sys.stderr)
+    return 1
+
+  print(json.dumps(records, separators=(",", ":")))
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

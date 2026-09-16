@@ -1,0 +1,221 @@
+# Agents
+
+One bar icon and one panel for every AI coding subscription on the machine.
+
+The panel is a balance sheet, not a dashboard: a subscription shows how much of
+its allowance is gone and when the window comes back, and a pay-per-token
+account shows what is left on the meter. One row per subscription, all on
+screen at once.
+
+This is a **clone** of the built-in `omarchy.agents` plugin. `Panel.qml` owns
+the bar button and the popup; `Main.qml` discovers and watches the records;
+`Agent.qml` is the per-record file watcher. Everything below is specific to the
+clone.
+
+> **Changing this plugin's QML needs a shell restart.** Saving a file under
+> `~/.config/omarchy/plugins/` reloads plugin code, but on this shell version
+> the bar widget's component is reused rather than recompiled, so edits to
+> `Panel.qml` or `Main.qml` only take effect after `omarchy restart shell`.
+> Collector scripts are ordinary executables and are picked up immediately.
+
+## Panel
+
+- **One row per subscription**, in the order the providers are listed in
+  settings, each with its mark, its name, and its plan underneath.
+- **Prepaid accounts** show what is left and what has been spent, with a meter
+  that drains toward empty.
+- **Subscriptions** show one line per rolling window (`5h`, `7d`, `30d`): a bar,
+  and the time until it resets. The bar *is* the percentage, so the number is
+  not repeated beside it — label, bar, and countdown all line up across windows,
+  which is what makes three of them scannable at a glance. The fullest window
+  keeps full contrast because it is the one that will stop the next prompt.
+- **A card we cannot read collapses to its mark**, in a row of linked buttons
+  along the bottom. Fireworks gates its ledger to the dashboard, Claude Code
+  reports nothing until it is signed in, and Replicate publishes no balance at
+  all, so there is no figure to draw — but there is a page that has it.
+- **Every card is a link.** Clicking anywhere on a row, or on a bottom button,
+  opens that provider's own usage or billing page with
+  `omarchy-launch-browser` and closes the panel. The URLs live in
+  `Panel.qml`'s `billingUrl()`; that map is the one place to edit.
+- The bar dot lights when any window passes 90% or any prepaid account drops to
+  its last 10%.
+
+The row/button split is computed, not configured: a card grows into a row as
+soon as it has a balance or a window to show. Zen folded onto Go and GitHub
+Copilot stays off, so the current five are Codex, DeepSeek, OpenCode and
+OpenRouter as rows, with Fireworks, Claude and Replicate as buttons.
+
+`j`/`k` or arrows scroll, `r` or Enter refreshes, Tab moves to the neighboring
+bar panel, Esc closes. IPC: `omarchy-shell omarchy.agents
+<open|close|toggle|refresh|next>`.
+
+## Data
+
+Each agent is one JSON record in `~/.local/state/omarchy/agents/usage/`. The
+widget invokes `bin/omarchy-agents-refresh` on its refresh timer and whenever
+you ask for a refresh, and picks up any record that lands in the directory.
+
+That wrapper runs the upstream collectors (`omarchy-agent-usage-update`, which
+covers **Claude**, **Codex**, and **Fireworks**) alongside this plugin's
+`bin/omarchy-agent-usage-opencode`, which covers everything else. It accepts the
+same arguments as the stock command (`--force`, `--limits-only`, `--except
+<agent>`, an explicit agent list) and is not required: without it the upstream
+records still refresh.
+
+The two sides run at once and write **disjoint records** — one writer per file —
+so neither waits on the other. That matters because the upstream claude
+collector can take ~30s walking an 8.9 GB database, and the rows this plugin
+owns should not be held hostage to it. Measured: every record this plugin writes
+lands at **t+2s**, whatever the upstream side is doing.
+
+A provider that is switched on in settings is listed even before its records
+exist, so the list never grows or reorders itself mid-refresh — the rows are
+there from the first frame and their numbers fill in.
+
+| Card | Windows | Balance | Sessions |
+|---|---|---|---|
+| Codex | 5h + 7d, from the ChatGPT backend | — | opencode (`openai` folded in) |
+| DeepSeek | — | live, `api.deepseek.com/user/balance` | opencode |
+| OpenCode | 5h + 7d + 30d, from `opencode.ai/zen/go/v1/usage` | none published | opencode (`opencode` + `opencode-go`) |
+| OpenRouter | — | live, `openrouter.ai/api/v1/credits` | opencode |
+| Fireworks | — | estimated (upstream; needs `fundedAmount`) | opencode |
+| Claude Code | 5h + 7d, from Anthropic's OAuth endpoint | — | upstream |
+| Replicate | — | none published | opencode |
+
+The last three have no readable figure and render as linked marks. Claude's row
+would fill in if it were signed in — its collector reports nothing while logged
+out, which is why it currently shows a mark instead.
+
+**Zen and Go share the OpenCode row.** They are one product to a user, and Zen
+has no API at all — a second row that could only ever say "balance unavailable"
+is noise. Go supplies the three windows; Zen's sessions supply the counts.
+
+**A card with no figures still gets a record**, emitted blank so the panel has
+something to hang a mark on. That is why "no data" is a record rather than a
+missing file.
+
+## The Codex card
+
+Codex is built here rather than by the upstream codex collector, because that
+collector reads the Codex CLI's app-server RPC — and that RPC needs `codex
+login`, while **connecting Codex in opencode's TUI stores an OAuth credential in
+opencode's database instead, leaving no `~/.codex/auth.json` at all**. The CLI
+then reports an empty record while a working subscription sits right there.
+
+So this collector reads opencode's `openai` credential (or `~/.codex/auth.json`
+if the CLI is logged in) and asks the ChatGPT backend for the account's rolling
+windows. opencode sessions running on the `openai` providerID fold onto the same
+card. The wrapper passes `--except codex` to the upstream command, so exactly one
+collector writes that file — two writers meant the row blanked out whenever the
+upstream one won.
+
+## The opencode collector
+
+opencode is where the pay-per-token subscriptions are actually spent, and it
+keeps its own books, so one pass over its database covers every provider at
+once.
+
+| providerID in opencode | Card |
+|---|---|
+| `deepseek` | DeepSeek |
+| `openrouter` | OpenRouter |
+| `opencode`, `opencode-go` | OpenCode *(folded into one card)* |
+| `openai` | Codex *(folded onto the codex card)* |
+| `github-copilot` | GitHub Copilot |
+| `fireworks-ai` | *(skipped — the `fireworks` collector owns it)* |
+| `anthropic` | *(skipped — the `claude` collector owns it)* |
+| `ollama*`, `localhost`, `lmstudio`, `vllm`, `replicate` | *(skipped)* |
+
+Skipping matters: counting a provider in two records would show every one of its
+tokens twice.
+
+Any providerID can be added, renamed, folded, or dropped without editing the
+script:
+
+```json
+// ~/.config/omarchy/agents/opencode.json
+{
+  "providers": {
+    "replicate": { "name": "Replicate", "tierLabel": "Prepaid" },
+    "openrouter": { "enabled": false }
+  }
+}
+```
+
+### What the numbers come from
+
+For session history, two tables — neither of them the 8.9 GB `message` table
+the upstream claude/codex collectors walk:
+
+| Table | Used for |
+|---|---|
+| `session_v2` | the session → providerID and model map |
+| `part` (`type = "step-finish"`) | per-step tokens, and the timestamp that dates them |
+| `session_message` (`type = "user"`) | prompt and session counts |
+
+The panel no longer draws any of that, so it is there for the record contract
+and for synced aggregation rather than for display. If you are sure you will
+never want it, the scan is the expensive part of this collector and could go.
+
+### Known limits
+
+- **OpenCode Zen publishes no balance or usage API.** `zen/v1/balance` and
+  `zen/v1/usage` both 404; an open feature request tracks it. Zen can report
+  what it spent but not what is left.
+- **GitHub Copilot's quota is not reachable here.** The usage endpoint requires
+  a Copilot-entitled GitHub token, and no Copilot credential is stored by
+  opencode on this machine.
+- **Roughly 170M historical tokens are unattributed.** 42 sessions predate
+  opencode recording a model at all.
+- **Days before 2026-02-13 are unreliable** in the session history: older
+  history was migrated into `part` rows stamped with the migration time.
+- **Model attribution follows the session's model**, so a session that switched
+  models counts all of its tokens toward the model it ended on.
+- **opencode.ai sits behind Cloudflare and rejects a bare `Python-urllib` user
+  agent** with 403. The collector identifies itself, as opencode's docs ask.
+
+## Settings
+
+Settings live in the widget's entry in `~/.config/omarchy/shell.json`, set with
+`omarchy bar set jace.agents <key> <value>`:
+
+| Key | Default | What it does |
+|---|---|---|
+| `refreshIntervalSec` | `900` | How often the records regenerate |
+| `syncMode` | `"Off"` | `"On"` writes this machine's snapshot and merges the others |
+| `syncDir` | `""` | A folder synced by Syncthing, Dropbox, rsync, … |
+| `syncFileName` | `<hostname>.json` | This machine's snapshot file |
+| `syncDeviceId` | hostname | Stable device name inside the snapshot |
+
+Numbers need `--json`, or they land in `shell.json` as strings:
+
+```bash
+omarchy bar set jace.agents refreshIntervalSec 300 --json
+```
+
+**Row order** comes from the plugin's own default list
+(`fireworks codex deepseek opencode-go opencode github-copilot openrouter
+claude`), because the shell does not merge a manifest's `barWidget.defaults`
+into a widget's settings. Setting `providers` replaces it — the key order there
+is the row order:
+
+```bash
+omarchy bar set jace.agents providers '{
+  "codex": { "enabled": true },
+  "opencode-go": { "enabled": true },
+  "deepseek": { "enabled": true },
+  "openrouter": { "enabled": true },
+  "fireworks": { "enabled": true }
+}' --json
+```
+
+`enabled: false` hides a subscription that is installed. Disabled agents are
+also skipped when the records regenerate.
+
+## Assets
+
+`assets/<id>.svg` is the mark for dark surfaces, with an `assets/<id>-light.svg`
+twin for light ones; a brand-coloured mark that works on both ships one file.
+A missing mark is not an error — the bar glyph stands in. The DeepSeek,
+OpenRouter, OpenCode, and GitHub Copilot marks come from
+[Simple Icons](https://simpleicons.org) (CC0).
