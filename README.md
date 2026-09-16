@@ -112,17 +112,19 @@ missing file.
 ## The OpenAI card
 
 The OpenAI card is built here rather than by the upstream codex collector,
-because that collector reads the Codex CLI's app-server RPC — and that RPC needs `codex
-login`, while **connecting Codex in opencode's TUI stores an OAuth credential in
-opencode's database instead, leaving no `~/.codex/auth.json` at all**. The CLI
-then reports an empty record while a working subscription sits right there.
+because that collector reads the Codex CLI's app-server RPC — and that RPC needs
+`codex login`, while **connecting Codex in opencode's TUI stores an OAuth
+credential in opencode's database instead, leaving no `~/.codex/auth.json` at
+all**. The CLI then reports an empty record while a working subscription sits
+right there.
 
 So this collector reads opencode's `openai` credential (or `~/.codex/auth.json`
 if the CLI is logged in) and asks the ChatGPT backend for the account's rolling
-windows. opencode sessions running on the `openai` providerID fold onto the same
-card. The wrapper passes `--except codex` to the upstream command, so exactly one
-collector writes that file — two writers meant the row blanked out whenever the
-upstream one won.
+windows. opencode sessions running on the `openai` providerID land on the same
+card, as does a `codex` providerID if one ever appears — both names describe one
+subscription. The wrapper passes `--except codex` to the upstream command, so
+exactly one collector writes that file; two writers meant the row blanked out
+whenever the upstream one won.
 
 ## The opencode collector
 
