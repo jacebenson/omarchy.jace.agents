@@ -54,9 +54,9 @@ clone.
   its last 10%.
 
 The row/button split is computed, not configured: a card grows into a row as
-soon as it has a balance or a window to show. Zen folded onto Go and GitHub
-Copilot stays off, so the current five are Codex, DeepSeek, OpenCode and
-OpenRouter as rows, with Fireworks, Claude and Replicate as buttons.
+soon as it has a balance or a window to show. GitHub Copilot stays off, so the
+current rows are OpenAI, OpenCode Go, DeepSeek, Fireworks and OpenRouter, with
+Claude, Replicate and OpenCode Zen as buttons.
 
 `j`/`k` or arrows scroll, `r` or Enter refreshes, Tab moves to the neighboring
 bar panel, Esc closes. IPC: `omarchy-shell omarchy.agents
@@ -87,9 +87,10 @@ there from the first frame and their numbers fill in.
 
 | Card | Windows | Balance | Sessions |
 |---|---|---|---|
-| Codex | 5h + 7d, from the ChatGPT backend | — | opencode (`openai` folded in) |
+| OpenAI | 5h + 7d, from the ChatGPT backend | — | opencode (`openai`, `codex` folded in) |
 | DeepSeek | — | live, `api.deepseek.com/user/balance` | opencode |
-| OpenCode | 5h + 7d + 30d, from `opencode.ai/zen/go/v1/usage` | none published | opencode (`opencode` + `opencode-go`) |
+| OpenCode Go | 5h + 7d + 30d, from `opencode.ai/zen/go/v1/usage` | — | opencode (`opencode-go`) |
+| OpenCode Zen | none published | none published | opencode (`opencode`) |
 | OpenRouter | — | live, `openrouter.ai/api/v1/credits` | opencode |
 | Fireworks | — | estimated (upstream; needs `fundedAmount`) | opencode |
 | Claude Code | 5h + 7d, from Anthropic's OAuth endpoint | — | upstream |
@@ -99,18 +100,19 @@ The last three have no readable figure and render as linked marks. Claude's row
 would fill in if it were signed in — its collector reports nothing while logged
 out, which is why it currently shows a mark instead.
 
-**Zen and Go share the OpenCode row.** They are one product to a user, and Zen
-has no API at all — a second row that could only ever say "balance unavailable"
-is noise. Go supplies the three windows; Zen's sessions supply the counts.
+**Go and Zen are separate cards**, because a card is one account you owe and one
+card cannot be two things: Go is a subscription with rolling windows, Zen is a
+credit balance. Go shows its three windows; Zen has no API at all, so it has no
+figure to show and collapses to its mark like the other unreadable accounts.
 
 **A card with no figures still gets a record**, emitted blank so the panel has
 something to hang a mark on. That is why "no data" is a record rather than a
 missing file.
 
-## The Codex card
+## The OpenAI card
 
-Codex is built here rather than by the upstream codex collector, because that
-collector reads the Codex CLI's app-server RPC — and that RPC needs `codex
+The OpenAI card is built here rather than by the upstream codex collector,
+because that collector reads the Codex CLI's app-server RPC — and that RPC needs `codex
 login`, while **connecting Codex in opencode's TUI stores an OAuth credential in
 opencode's database instead, leaving no `~/.codex/auth.json` at all**. The CLI
 then reports an empty record while a working subscription sits right there.
@@ -132,8 +134,10 @@ once.
 |---|---|
 | `deepseek` | DeepSeek |
 | `openrouter` | OpenRouter |
-| `opencode`, `opencode-go` | OpenCode *(folded into one card)* |
-| `openai` | Codex *(folded onto the codex card)* |
+| `opencode-go` | OpenCode Go |
+| `opencode` | OpenCode Zen |
+| `openai` | OpenAI |
+| `codex` | OpenAI *(folded — both names are one subscription)* |
 | `github-copilot` | GitHub Copilot |
 | `fireworks-ai` | *(skipped — the `fireworks` collector owns it)* |
 | `anthropic` | *(skipped — the `claude` collector owns it)* |

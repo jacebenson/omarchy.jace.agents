@@ -88,7 +88,8 @@ LIMITS_ONLY_REUSE_SECONDS = 900
 # is prepaid; the numbers always come from opencode's own accounting.
 CARD_DEFAULTS = {
   "deepseek": {"name": "DeepSeek", "tierLabel": "Prepaid"},
-  "opencode-go": {"name": "OpenCode", "tierLabel": "Go + Zen"},
+  "opencode-go": {"name": "OpenCode Go", "tierLabel": "Subscription"},
+  "opencode": {"name": "OpenCode Zen", "tierLabel": "Prepaid"},
   "openai": {"name": "OpenAI", "tierLabel": "Subscription"},
   "github-copilot": {"name": "GitHub Copilot", "tierLabel": "Subscription"},
   "openrouter": {"name": "OpenRouter", "tierLabel": "Prepaid"},
@@ -109,10 +110,13 @@ UPSTREAM_PROVIDER_IDS = {"fireworks-ai", "anthropic"}
 
 # providerIDs that are really another card's account. opencode's `openai`
 # providerID IS the card; a `codex` providerID, if one ever appears, belongs on
-# the same card, because both names describe one ChatGPT subscription. Zen folds
-# onto the Go card: one product to a user, and a row that could only ever say
-# "balance unavailable" is noise.
-CARD_FOLDS = {"codex": "openai", "opencode": "opencode-go"}
+# the same card, because both names describe one ChatGPT subscription.
+#
+# Go and Zen are deliberately NOT folded. They are one product with two billing
+# relationships — a subscription with rolling windows, and a credit balance —
+# and one card cannot be two things. separate cards keep the rule simple: a card
+# is one account you owe, and it shows whatever that account can report.
+CARD_FOLDS = {"codex": "openai"}
 
 # Local endpoints and free tiers: nothing to subscribe to, nothing to track.
 # Replicate is NOT here: it is a paid account with no usage API, and the panel
