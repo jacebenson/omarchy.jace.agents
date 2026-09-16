@@ -48,17 +48,25 @@ Panel {
   }
 
   // Where each provider's real numbers live. This is the one place to edit when
-  // a provider moves its billing page; there is nothing to configure, because
-  // a dashboard is in the same place for everyone.
+  // a provider moves its billing page; there is nothing to configure, because a
+  // dashboard is in the same place for everyone.
+  //
+  // Every card the collector can emit needs an entry here, or its details have
+  // no link and the only way to the dashboard is gone. The authoritative list
+  // of ids is CARD_DEFAULTS in bin/omarchy-agent-usage-opencode, plus `claude`
+  // and `fireworks`, which the upstream collectors own.
   function billingUrl(providerId) {
     var urls = {
       "openai": "https://chatgpt.com/?openaicom_referred=true#settings/Usage",
-      "deepseek": "https://platform.deepseek.com/usage",
+      "openai-api": "https://platform.openai.com/settings/organization/billing/overview",
       "opencode-go": "https://opencode.ai/auth",
+      "opencode": "https://opencode.ai/auth",
+      "deepseek": "https://platform.deepseek.com/usage",
       "openrouter": "https://openrouter.ai/settings/credits",
       "fireworks": "https://fireworks.ai/account/billing",
       "claude": "https://claude.ai/settings/usage",
-      "replicate": "https://replicate.com/"
+      "replicate": "https://replicate.com/",
+      "github-copilot": "https://github.com/settings/copilot"
     }
     return urls[providerId] || ""
   }
