@@ -65,6 +65,15 @@ Panel {
     root.close()
   }
 
+  // Which card is showing its details. One at a time: the panel is height
+  // capped, and a column of open drawers buries the numbers the panel exists
+  // for.
+  property string expandedProviderId: ""
+
+  function toggleExpanded(providerId) {
+    expandedProviderId = expandedProviderId === String(providerId) ? "" : String(providerId)
+  }
+
   // Countdowns and balances read this instead of Date.now() so the panel keeps
   // telling the truth while it sits open.
   property double nowMs: Date.now()
@@ -280,6 +289,8 @@ Panel {
 
   onOpenedChanged: if (opened) {
     nowMs = Date.now()
+    // A fresh look at fresh numbers: start collapsed every time.
+    expandedProviderId = ""
     if (panelFlick) panelFlick.contentY = 0
     usage.refreshLimits()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -410,6 +421,20 @@ Panel {
             }
           }
 
+          // The details for a mark-only button open under the whole row, so the
+          // row keeps its even, icon-sized rhythm instead of one tile growing
+          // taller than its neighbours.
+          ProviderDetails {
+            id: linkedDetails
+            visible: root.expandedProviderId !== "" && root.linkedProviders.some(function(p) {
+              return p.providerId === root.expandedProviderId
+            })
+            provider: root.linkedProviders.find(function(p) {
+              return p.providerId === root.expandedProviderId
+            }) || null
+            width: parent.width
+          }
+
           Text {
             textFormat: Text.PlainText
             visible: text !== ""
@@ -423,6 +448,60 @@ Panel {
             elide: Text.ElideRight
           }
         }
+      }
+    }
+  }
+
+  // What sits behind a card once it is expanded. It is the same block for a
+  // full row and for a mark-only button, because what you can configure has
+  // nothing to do with whether the figure happens to be readable.
+  component ProviderDetails: Column {
+    id: providerDetails
+    property var provider: null
+
+    readonly property string url: root.billingUrl(provider ? provider.providerId : "")
+    readonly property string name: provider ? String(provider.providerName || provider.providerId) : ""
+
+    width: parent ? parent.width : implicitWidth
+    topPadding: Style.space(4)
+    spacing: Style.space(4)
+
+    // The link comes first: it is the thing you reach for most, and it is the
+    // only one every provider has.
+    Item {
+      visible: providerDetails.url !== ""
+      width: parent.width
+      implicitHeight: linkLabel.implicitHeight + Style.space(12)
+
+      Rectangle {
+        anchors.fill: parent
+        radius: Style.cornerRadius
+        color: root.alpha(root.foreground, linkHover.containsMouse ? 0.10 : 0.05)
+
+        Behavior on color { ColorAnimation { duration: 120 } }
+      }
+
+      Text {
+        id: linkLabel
+        textFormat: Text.PlainText
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: Style.space(10)
+        anchors.rightMargin: Style.space(10)
+        anchors.verticalCenter: parent.verticalCenter
+        text: "Open " + providerDetails.name + "'s billing page"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+
+      MouseArea {
+        id: linkHover
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.openBilling(providerDetails.provider)
       }
     }
   }
@@ -508,138 +587,153 @@ Panel {
       : (balance ? balanceBlock : windowColumn)
 
     width: parent ? parent.width : implicitWidth
-    implicitHeight: Math.max(Style.font.display, labels.implicitHeight, trailing.height) + Style.spacing.xl
+    implicitHeight: summary.implicitHeight + (details.visible ? details.height + Style.spacing.md : 0)
 
+    readonly property bool expanded: root.expandedProviderId === (provider ? provider.providerId : "")
     readonly property bool hovered: rowHover.containsMouse
 
     Rectangle {
       anchors.fill: parent
       radius: Style.cornerRadius
-      color: root.alpha(root.foreground, providerRow.hovered ? 0.09 : 0.04)
+      // An open card stays lit so it is obvious which one you are looking at.
+      color: root.alpha(root.foreground, (providerRow.hovered || providerRow.expanded) ? 0.09 : 0.04)
 
       Behavior on color { ColorAnimation { duration: 120 } }
     }
 
-    ProviderMark {
-      id: mark
-      provider: providerRow.provider
-      anchors.left: parent.left
-      anchors.leftMargin: Style.spacing.xl
-      anchors.verticalCenter: parent.verticalCenter
-    }
-
-    // ---------- name and plan ----------
-    Column {
-      id: labels
-      anchors.left: mark.right
-      anchors.leftMargin: Style.space(14)
-      anchors.right: trailing.left
-      anchors.rightMargin: Style.spacing.md
-      anchors.verticalCenter: parent.verticalCenter
-      spacing: Style.space(2)
-
-      Text {
-        id: nameText
-        textFormat: Text.PlainText
-        width: parent.width
-        text: providerRow.provider ? providerRow.provider.providerName : ""
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.title
-        font.bold: true
-        elide: Text.ElideRight
-      }
-
-      Text {
-        id: subLine
-        textFormat: Text.PlainText
-        width: parent.width
-        text: root.subText(providerRow.provider)
-        color: providerRow.hasStatus ? root.urgent : root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
-      }
-    }
-
-    // ---------- balance or allowance ----------
     Item {
-      id: trailing
+      id: summary
+      anchors.left: parent.left
       anchors.right: parent.right
-      anchors.rightMargin: Style.spacing.xl
-      anchors.verticalCenter: parent.verticalCenter
-      width: providerRow.trailingBlock ? providerRow.trailingBlock.width : 0
-      height: providerRow.trailingBlock ? providerRow.trailingBlock.height : 0
+      anchors.top: parent.top
+      implicitHeight: Math.max(Style.font.display, labels.implicitHeight, trailing.height) + Style.spacing.xl
 
-      Column {
-        id: balanceBlock
-        visible: !providerRow.hasStatus && !!providerRow.balance
-        anchors.right: parent.right
+      ProviderMark {
+        id: mark
+        provider: providerRow.provider
+        anchors.left: parent.left
+        anchors.leftMargin: Style.spacing.xl
         anchors.verticalCenter: parent.verticalCenter
-        spacing: Style.space(6)
+      }
+
+      // ---------- name and plan ----------
+      Column {
+        id: labels
+        anchors.left: mark.right
+        anchors.leftMargin: Style.space(14)
+        anchors.right: trailing.left
+        anchors.rightMargin: Style.spacing.md
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(2)
 
         Text {
-          id: balanceValue
+          id: nameText
           textFormat: Text.PlainText
-          anchors.right: parent.right
-          text: providerRow.balance
-            ? root.formatMoney(providerRow.balance.remaining, providerRow.balance.currency)
-            : ""
-          color: providerRow.balanceAlarming ? root.urgent : root.foreground
+          width: parent.width
+          text: providerRow.provider ? providerRow.provider.providerName : ""
+          color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.title
           font.bold: true
+          elide: Text.ElideRight
         }
 
-        Meter {
-          id: balanceMeter
-          visible: providerRow.balanceRatio >= 0
-          width: Style.space(96)
-          // Collapse the rail when there is no funded figure to draw it
-          // against, so an unknown total costs no vertical space.
-          thickness: providerRow.balanceRatio >= 0
-            ? Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
-            : 0
-          value: providerRow.balanceRatio
-          alarming: providerRow.balanceAlarming
+        Text {
+          id: subLine
+          textFormat: Text.PlainText
+          width: parent.width
+          text: root.subText(providerRow.provider)
+          color: providerRow.hasStatus ? root.urgent : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
         }
       }
 
-      Column {
-        id: windowColumn
-        visible: !providerRow.hasStatus && !providerRow.balance && providerRow.limits.length > 0
+      // ---------- balance or allowance ----------
+      Item {
+        id: trailing
         anchors.right: parent.right
+        anchors.rightMargin: Style.spacing.xl
         anchors.verticalCenter: parent.verticalCenter
-        spacing: Style.space(4)
+        width: providerRow.trailingBlock ? providerRow.trailingBlock.width : 0
+        height: providerRow.trailingBlock ? providerRow.trailingBlock.height : 0
 
-        Repeater {
-          model: providerRow.limits
+        Column {
+          id: balanceBlock
+          visible: !providerRow.hasStatus && !!providerRow.balance
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(6)
 
-          LimitLine {
-            required property var modelData
-            window: modelData
-            primary: modelData.percent >= providerRow.bindingPercent
+          Text {
+            id: balanceValue
+            textFormat: Text.PlainText
+            anchors.right: parent.right
+            text: providerRow.balance
+              ? root.formatMoney(providerRow.balance.remaining, providerRow.balance.currency)
+              : ""
+            color: providerRow.balanceAlarming ? root.urgent : root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+          }
+
+          Meter {
+            id: balanceMeter
+            visible: providerRow.balanceRatio >= 0
+            width: Style.space(96)
+            // Collapse the rail when there is no funded figure to draw it
+            // against, so an unknown total costs no vertical space.
+            thickness: providerRow.balanceRatio >= 0
+              ? Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
+              : 0
+            value: providerRow.balanceRatio
+            alarming: providerRow.balanceAlarming
+          }
+        }
+
+        Column {
+          id: windowColumn
+          visible: !providerRow.hasStatus && !providerRow.balance && providerRow.limits.length > 0
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(4)
+
+          Repeater {
+            model: providerRow.limits
+
+            LimitLine {
+              required property var modelData
+              window: modelData
+              primary: modelData.percent >= providerRow.bindingPercent
+            }
           }
         }
       }
-    }
 
-    // The whole card is the link. A provider whose numbers we cannot read still
-    // has a dashboard that knows them, and this is the shortest path to it.
-    MouseArea {
-      id: rowHover
-      anchors.fill: parent
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      onClicked: root.openBilling(providerRow.provider)
-    }
-
-    PanelToolTip {
-      visible: rowHover.containsMouse && root.billingUrl(providerRow.provider ? providerRow.provider.providerId : "") !== ""
-      text: "Open " + (providerRow.provider ? providerRow.provider.providerName : "") + " billing"
-      fontFamily: root.fontFamily
-    }
+    // Clicking the card opens it rather than leaving for the browser: the page
+      // it would have opened is the first thing inside.
+      MouseArea {
+        id: rowHover
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.toggleExpanded(providerRow.provider ? providerRow.provider.providerId : "")
+      }
   }
+
+  ProviderDetails {
+    id: details
+    visible: providerRow.expanded
+    provider: providerRow.provider
+    anchors.left: parent.left
+    anchors.right: parent.right
+    anchors.top: summary.bottom
+    anchors.leftMargin: Style.spacing.xl
+    anchors.rightMargin: Style.spacing.xl
+  }
+}
 
   // A provider we can spend money on but cannot read: Fireworks gates its
   // ledger to the dashboard, Claude Code reports nothing until it is signed in,
@@ -651,13 +745,16 @@ Panel {
     property bool isProviderCard: true
 
     readonly property bool hovered: buttonHover.containsMouse
+    readonly property bool expanded: root.expandedProviderId === (provider ? provider.providerId : "")
 
     implicitHeight: Style.font.display + Style.spacing.xl
 
     Rectangle {
       anchors.fill: parent
       radius: Style.cornerRadius
-      color: root.alpha(root.foreground, linkedButton.hovered ? 0.09 : 0.04)
+      // A button whose details are open stays lit, so the block underneath is
+      // clearly attached to it.
+      color: root.alpha(root.foreground, (linkedButton.hovered || linkedButton.expanded) ? 0.09 : 0.04)
 
       Behavior on color { ColorAnimation { duration: 120 } }
     }
@@ -672,7 +769,7 @@ Panel {
       anchors.fill: parent
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
-      onClicked: root.openBilling(linkedButton.provider)
+      onClicked: root.toggleExpanded(linkedButton.provider ? linkedButton.provider.providerId : "")
     }
 
     // With only a logo on screen, the tooltip carries the name — and any reason
@@ -685,7 +782,6 @@ Panel {
         var parts = [String(p.providerName || "")]
         var status = String(p.usageStatusText || "")
         if (status !== "") parts.push(status)
-        parts.push("open billing")
         return parts.join(" · ")
       }
       fontFamily: root.fontFamily
