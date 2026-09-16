@@ -971,6 +971,43 @@ def set_funded(provider_id: str, raw_amount: str) -> int:
   return 0
 
 
+def set_order(raw_ids: str) -> int:
+  """Record the order the cards should be drawn in.
+
+  Only the plugin's own config file is touched. The obvious home for this was
+  the widget's entry in shell.json, but `omarchy bar set` cannot store an array
+  there: a two-element array is rejected outright by the shell's IPC, and a
+  one-element array is silently stored as a bare string. The plugin config is
+  also the more honest place — this is display state for one plugin, not bar
+  layout.
+
+  The caller sends the ids it is already drawing, in the order it wants them, so
+  the panel decides the sequence and this only validates and writes it.
+  """
+  ids = [part.strip() for part in str(raw_ids or "").split(",") if part.strip()]
+  if not ids:
+    print("omarchy-agent-usage-opencode: refusing to write an empty order", file=sys.stderr)
+    return 2
+  for provider_id in ids:
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", provider_id):
+      print(f"omarchy-agent-usage-opencode: refusing suspicious provider id {provider_id!r}", file=sys.stderr)
+      return 2
+
+  path = card_config_path()
+  config = read_json(path)
+  config["order"] = ids
+
+  try:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, config)
+  except OSError as error:
+    print(f"omarchy-agent-usage-opencode: could not write {path} ({error})", file=sys.stderr)
+    return 2
+
+  print(json.dumps({"order": ids}))
+  return 0
+
+
 def prune_folded_records(cards: dict[str, dict[str, Any]]) -> None:
   """Delete records left behind by a fold.
 
@@ -996,12 +1033,16 @@ def main() -> int:
   parser.add_argument("--except", action="append", default=[], dest="excluded")
   parser.add_argument("--set-funded", nargs=2, metavar=("PROVIDER", "AMOUNT"), default=None,
                       help="Record how much has been funded for an estimated balance, then exit")
+  parser.add_argument("--set-order", default=None, metavar="ID,ID,...",
+                      help="Record the order the cards are drawn in, then exit")
   parser.add_argument("cards", nargs="*")
   args = parser.parse_args()
 
   # Writing one config is not a refresh: leave before the database is touched.
   if args.set_funded:
     return set_funded(str(args.set_funded[0]), str(args.set_funded[1]))
+  if args.set_order is not None:
+    return set_order(str(args.set_order))
 
   only = [str(card) for card in args.cards if str(card)]
   excluded = {str(card) for card in args.excluded}

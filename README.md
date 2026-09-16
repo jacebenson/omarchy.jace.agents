@@ -25,7 +25,16 @@ clone.
   alphabetical — a subscription is paid for whether or not you use it, while a
   prepaid balance only costs what you spend. The grouping is read off each
   record, so a card moves between groups on its own the day it starts reporting
-  something new. Set the `order` key to an array of provider ids to override it.
+  something new.
+- **Clicking a card opens it in place**, like a `<details>` element: a link to
+  that provider's billing page, a funded amount where the balance is an
+  estimate, and **Move to top / Move to bottom**. One card at a time, and
+  opening the panel collapses everything.
+- **Reordering stays inside a group.** The group answers "what can I still
+  lose?", so it is the rule rather than a default to be buried; the stored order
+  decides the sequence within a group. A provider that appears after the last
+  reorder keeps its alphabetical place at the end of its group until the next
+  move rewrites the list.
 - **Prepaid accounts** show what is left and what has been spent, with a meter
   that drains toward empty.
 - **Subscriptions** show one line per rolling window (`5h`, `7d`, `30d`): a bar,
@@ -197,19 +206,33 @@ Numbers need `--json`, or they land in `shell.json` as strings:
 omarchy bar set jace.agents refreshIntervalSec 300 --json
 ```
 
-**Row order** comes from the plugin's own default list
-(`fireworks codex deepseek opencode-go opencode github-copilot openrouter
-claude`), because the shell does not merge a manifest's `barWidget.defaults`
-into a widget's settings. Setting `providers` replaces it — the key order there
-is the row order:
+**Row order** is computed, not configured: subscriptions before prepaid accounts
+(same rule as above), each group alphabetical. Use **Move to top / Move to
+bottom** on a card to override it, which writes the plugin's own config:
+
+```jsonc
+// ~/.config/omarchy/agents/opencode.json
+{
+  "providers": { "github-copilot": { "enabled": false } },
+  "order": ["opencode-go", "openai", "deepseek", "fireworks", "openrouter"]
+}
+```
+
+It lives there rather than in the widget's settings because `omarchy bar set`
+cannot store an array: a two-element array is rejected by the shell's IPC, and a
+one-element array is silently stored as a bare string.
+
+`enabled` decides whether a card is drawn at all; omitting a provider leaves it
+enabled:
 
 ```bash
 omarchy bar set jace.agents providers '{
-  "codex": { "enabled": true },
+  "openai": { "enabled": true },
   "opencode-go": { "enabled": true },
   "deepseek": { "enabled": true },
   "openrouter": { "enabled": true },
-  "fireworks": { "enabled": true }
+  "fireworks": { "enabled": true },
+  "github-copilot": { "enabled": false }
 }' --json
 ```
 

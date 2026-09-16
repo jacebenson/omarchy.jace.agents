@@ -75,6 +75,7 @@ Panel {
   }
 
   property string fundedError: ""
+  property string orderError: ""
 
   readonly property string collectorPath: localPath(Qt.resolvedUrl("bin/omarchy-agent-usage-opencode"))
 
@@ -105,6 +106,55 @@ Panel {
     fundedError = ""
     setFundedProcess.command = [root.collectorPath, "--set-funded", providerId, amount]
     setFundedProcess.running = true
+  }
+
+  function providerById(id) {
+    for (var i = 0; i < providers.length; i++)
+      if (providers[i].providerId === id) return providers[i]
+    return null
+  }
+
+  // How many cards share this one's group. With a single card there is nothing
+  // to reorder, so the controls stay out of the way.
+  function groupSize(p) {
+    var rank = p ? usage.providerRank(p) : -1
+    var count = 0
+    for (var i = 0; i < providers.length; i++)
+      if (usage.providerRank(providers[i]) === rank) count++
+    return count
+  }
+
+  // Moving happens inside a group, never across one: the group answers "what
+  // can I still lose?", which is the reason the list is in this order at all.
+  function moveProvider(p, toTop) {
+    if (!p || root.collectorPath === "") return
+
+    var ids = []
+    for (var i = 0; i < providers.length; i++) ids.push(providers[i].providerId)
+
+    var at = ids.indexOf(p.providerId)
+    if (at === -1) return
+    ids.splice(at, 1)
+
+    // Land on the first or last sibling still in the list.
+    var insertAt = ids.length
+    for (var j = 0; j < ids.length; j++) {
+      var sibling = root.providerById(ids[j])
+      if (!sibling || usage.providerRank(sibling) !== usage.providerRank(p)) continue
+      insertAt = toTop ? j : j + 1
+      if (toTop) break
+    }
+    ids.splice(insertAt, 0, p.providerId)
+
+    orderError = ""
+    setOrderProcess.command = [root.collectorPath, "--set-order", ids.join(",")]
+    setOrderProcess.running = true
+  }
+
+  Process {
+    id: setOrderProcess
+    running: false
+    onExited: function(code) { if (code !== 0) root.orderError = "Could not save" }
   }
 
   Process {
@@ -627,6 +677,47 @@ Panel {
         verticalPadding: Style.space(4)
         onClicked: providerDetails.commitFunded(fundedField.text)
       }
+    }
+
+    // Reordering, inside the group. Two buttons rather than a drag: dragging is
+    // a lot of machinery for a list this short, and this needs no tutorial.
+    Row {
+      id: moveRow
+      visible: root.groupSize(providerDetails.provider) > 1
+      width: parent.width
+      spacing: Style.spacing.md
+
+      readonly property real cellWidth: (width - spacing) / 2
+
+      Button {
+        width: moveRow.cellWidth
+        text: "Move to top"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        fontSize: Style.font.bodySmall
+        verticalPadding: Style.space(4)
+        onClicked: root.moveProvider(providerDetails.provider, true)
+      }
+
+      Button {
+        width: moveRow.cellWidth
+        text: "Move to bottom"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        fontSize: Style.font.bodySmall
+        verticalPadding: Style.space(4)
+        onClicked: root.moveProvider(providerDetails.provider, false)
+      }
+    }
+
+    Text {
+      textFormat: Text.PlainText
+      visible: text !== ""
+      width: parent.width
+      text: root.orderError
+      color: root.urgent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
     }
   }
 

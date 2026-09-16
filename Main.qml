@@ -227,38 +227,58 @@ Item {
     return sortProviders(result)
   }
 
+  // The plugin's own config, which the collector writes. It holds which
+  // providers are switched off and the order the cards are drawn in. Reading it
+  // here — and watching it — means a reorder lands without a shell restart,
+  // the same way a usage record does.
+  readonly property string cardConfigPath: (Quickshell.env("XDG_CONFIG_HOME") || home + "/.config") + "/omarchy/agents/opencode.json"
+  property var providerOrder: []
+
+  FileView {
+    id: cardConfigFile
+    path: root.cardConfigPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.applyCardConfig(text())
+    onLoadFailed: root.providerOrder = []
+  }
+
+  function applyCardConfig(content) {
+    var parsed = null
+    try { parsed = JSON.parse(String(content || "")) } catch (e) { parsed = null }
+    var order = parsed && parsed.order
+    providerOrder = Array.isArray(order) ? order.map(String) : []
+  }
+
   // The list reads subscriptions first, then prepaid accounts, each
   // alphabetically. A subscription is already paid for — not using it wastes
   // it — while a prepaid balance only ever costs what you spend. So the things
   // you can lose float to the top.
-  //
-  // The rank is read off the record, not from a list, so a card moves between
-  // groups on its own the day it starts reporting something new, and a provider
-  // this plugin has never heard of lands in the right place.
   function providerRank(p) {
     if (p.limits && p.limits.length > 0) return 0
     if (p.balance) return 1
     return 2
   }
 
-  // `order` is the escape hatch for when the default is not what you want: an
-  // explicit array of provider ids, listed first in that order, with everything
-  // else falling back to the groups above.
+  // The group is the rule and stays the rule: it is the answer to "which of
+  // these can I lose?", not a default someone should be able to bury. Inside a
+  // group the stored order wins, which is what the move buttons write; anything
+  // unlisted keeps its alphabetical place at the end, so a provider discovered
+  // after the last reorder still appears rather than vanishing.
   function sortProviders(list) {
-    var declared = setting("order", [])
     var rank = {}
-    if (Array.isArray(declared))
-      for (var i = 0; i < declared.length; i++) rank[String(declared[i])] = i
+    for (var i = 0; i < providerOrder.length; i++) rank[String(providerOrder[i])] = i
 
     var sorted = list.slice()
     sorted.sort(function(a, b) {
-      var da = rank[a.providerId] === undefined ? -1 : rank[a.providerId]
-      var db = rank[b.providerId] === undefined ? -1 : rank[b.providerId]
-      if (da !== db) return da - db
-
       var ga = providerRank(a)
       var gb = providerRank(b)
       if (ga !== gb) return ga - gb
+
+      var oa = rank[a.providerId] === undefined ? Number.MAX_SAFE_INTEGER : rank[a.providerId]
+      var ob = rank[b.providerId] === undefined ? Number.MAX_SAFE_INTEGER : rank[b.providerId]
+      if (oa !== ob) return oa - ob
 
       var na = String(a.providerName || a.providerId)
       var nb = String(b.providerName || b.providerId)
