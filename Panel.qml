@@ -94,15 +94,16 @@ Panel {
     return decodeURIComponent(text.substring(7))
   }
 
-  // The funded amount is not a balance — it is the half of an *estimated*
-  // balance that only you know: what you put in. So it belongs on exactly the
-  // providers whose figure is derived from it, and nowhere else. A provider
-  // that can read its real ledger already has the answer; a provider whose
-  // collector never reads this file would be showing a field that does nothing.
-  readonly property var fundedAmountProviders: ["fireworks", "opencode"]
+  // Cards whose remaining balance is worked out rather than read: you supply the
+  // figure you can see, and the spend comes from a provider API (Fireworks, the
+  // OpenAI API platform) or from opencode's own records (Zen). It belongs on
+  // exactly those cards — a provider that can read its real ledger already has
+  // the answer, and one whose collector never reads this file would be a field
+  // that does nothing.
+  readonly property var estimatedBalanceProviders: ["fireworks", "opencode", "openai-api"]
 
   function needsFundedAmount(p) {
-    if (!p || fundedAmountProviders.indexOf(p.providerId) === -1) return false
+    if (!p || estimatedBalanceProviders.indexOf(p.providerId) === -1) return false
     // A live ledger takes over the moment there is one: the estimate is a
     // fallback, so the field goes away rather than offering a second opinion.
     return !p.balance || p.balance.estimated === true

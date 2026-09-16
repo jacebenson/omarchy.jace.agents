@@ -91,6 +91,7 @@ there from the first frame and their numbers fill in.
 | DeepSeek | — | live, `api.deepseek.com/user/balance` | opencode |
 | OpenCode Go | 5h + 7d + 30d, from `opencode.ai/zen/go/v1/usage` | — | opencode (`opencode-go`) |
 | OpenCode Zen | — | estimated from opencode's own records | opencode (`opencode`) |
+| OpenAI API | — | estimated from `organization/costs` *(admin key)* | — |
 | OpenRouter | — | live, `openrouter.ai/api/v1/credits` | opencode |
 | Fireworks | — | estimated (upstream; needs `fundedAmount`) | opencode |
 | Claude Code | 5h + 7d, from Anthropic's OAuth endpoint | — | upstream |
@@ -222,7 +223,7 @@ config through the collector — the panel never builds JSON or touches a path:
 }
 ```
 
-**Funded** is the *balance you can see*, not the total you ever paid in, and
+**Balance** is the figure you can see, not the total you ever paid in, and
 `fundedAt` moves to today every time you save it. That is what keeps the spend
 window short — Fireworks' billing endpoint returns 503 for a long one — and what
 stops a later top-up from subtracting everything spent since the first time you
@@ -251,9 +252,26 @@ $DEEPSEEK_API_KEY / $OPENROUTER_API_KEY / $OPENCODE_GO_API_KEY
     -> opencode's ~/.local/share/opencode/auth.json
 ```
 
-So an explicit key needs no code and no UI: it wins over opencode's. Note that
-OpenAI's card is the exception — it reads opencode's **OAuth** credential (or
-`~/.codex/auth.json`), because a ChatGPT subscription has no API key.
+So an explicit key needs no code and no UI: it wins over opencode's.
+
+Two cards are the exception, each because its credential is not an ordinary
+provider key:
+
+- **OpenAI** (the ChatGPT subscription) reads opencode's **OAuth** credential, or
+  `~/.codex/auth.json`. A ChatGPT plan has no API key, and this is where its 5h
+  and weekly windows come from.
+- **OpenAI API** (the metered platform, a separate wallet and therefore a
+  separate card) reads an **organization admin** key from
+  `~/.config/omarchy/agents/openai-api.json`:
+
+  ```json
+  { "apiKey": "sk-admin-...", "fundedAmount": 50, "fundedAt": "2026-09-01" }
+  ```
+
+  `$OPENAI_ADMIN_KEY`, then `$OPENAI_API_KEY`, are checked first. A standard
+  project key **cannot** read `organization/costs` — the card will say so, which
+  is the fastest way to find out. Spend comes from that endpoint; the balance is
+  the figure you type, exactly as with Fireworks.
 
 ## Settings
 

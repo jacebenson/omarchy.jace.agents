@@ -55,6 +55,7 @@ SCHEMA_VERSION = 1
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
 CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 # The ChatGPT backend reports a Codex subscription's two rolling windows as the
@@ -91,6 +92,7 @@ CARD_DEFAULTS = {
   "opencode-go": {"name": "OpenCode Go", "tierLabel": "Subscription"},
   "opencode": {"name": "OpenCode Zen", "tierLabel": "Prepaid"},
   "openai": {"name": "OpenAI", "tierLabel": "Subscription"},
+  "openai-api": {"name": "OpenAI API", "tierLabel": "API"},
   "github-copilot": {"name": "GitHub Copilot", "tierLabel": "Subscription"},
   "openrouter": {"name": "OpenRouter", "tierLabel": "Prepaid"},
   "replicate": {"name": "Replicate", "tierLabel": "Prepaid"},
@@ -553,6 +555,105 @@ def fetch_opencode_go_limits() -> tuple[dict[str, Any], str]:
   return {"limits": limits}, ""
 
 
+def openai_admin_key() -> str:
+  """The API platform key used to read organization costs.
+
+  Deliberately separate from the OAuth credential the ChatGPT card reads: one is
+  a subscription, the other is a metered bill, and they are different accounts.
+  """
+  for env_var in ("OPENAI_ADMIN_KEY", "OPENAI_API_KEY"):
+    value = str(os.environ.get(env_var, "")).strip()
+    if value:
+      return value
+  return str(item_config(config_home() / "omarchy" / "agents" / "openai-api.json").get("apiKey") or "").strip()
+
+
+def fetch_openai_api_spend() -> tuple[dict[str, Any], str]:
+  """What is left on an API platform prepaid balance.
+
+  The same arrangement as Fireworks: you supply the balance you can see, and the
+  spend comes from the provider — here `organization/costs`, which reports
+  dollars and needs an *organization admin* key. A standard project key cannot
+  read it, so the failure message says so rather than leaving you guessing.
+  """
+  config = read_json(config_home() / "omarchy" / "agents" / "openai-api.json")
+  raw = config.get("fundedAmount")
+  if raw is None or str(raw).strip() == "":
+    return {}, ""
+  try:
+    funded = float(raw)
+  except (TypeError, ValueError):
+    return {}, ""
+  if not math.isfinite(funded):
+    return {}, ""
+
+  key = openai_admin_key()
+  if not key:
+    # Returned as overrides rather than as a status so the card is created even
+    # though it has no figure yet: this card exists to be configured, so saying
+    # what is missing IS its content.
+    return {
+      "usageStatusText": "Unavailable",
+      "authHelpText": "Set an OpenAI organization admin key in ~/.config/omarchy/agents/openai-api.json",
+    }, ""
+
+  funded_at = str(config.get("fundedAt") or "").strip()
+  try:
+    start = datetime.strptime(funded_at, "%Y-%m-%d").astimezone() if funded_at else datetime.now().astimezone()
+  except ValueError:
+    start = datetime.now().astimezone()
+
+  try:
+    total = openai_costs_total(key, start)
+  except OpencodeError as error:
+    # This card exists only because a balance was configured for it, so a
+    # failure to read the spend has to say so rather than leave a bare card.
+    return {"usageStatusText": "Unavailable", "authHelpText": f"OpenAI API: {error}"}, ""
+
+  return {"balance": {
+    "remaining": round(funded - total, 2),
+    "funded": funded,
+    "spent": round(total, 2),
+    "currency": "USD",
+    "estimated": False,
+  }}, ""
+
+
+def openai_costs_total(key: str, start: datetime) -> float:
+  """Dollars spent since `start`, summed over the day-bucketed cost report."""
+  total = 0.0
+  page: str | None = None
+  # The API buckets by day and pages with a cursor; a bounded walk keeps a bad
+  # `next_page` from looping forever.
+  for _ in range(10):
+    query: dict[str, Any] = {
+      "start_time": int(start.timestamp()),
+      "limit": 180,
+      "bucket_width": "1d",
+    }
+    if page:
+      query["page"] = page
+    try:
+      payload = get_json(OPENAI_COSTS_URL + "?" + urllib.parse.urlencode(query), key)
+    except OpencodeError as error:
+      if "refused the request" in str(error):
+        raise OpencodeError("this key cannot read organization costs — it must be an organization admin key (sk-admin-…)") from error
+      raise
+    for bucket in payload.get("data") or []:
+      if not isinstance(bucket, dict):
+        continue
+      for row in bucket.get("results") or []:
+        amount = (row or {}).get("amount") or {}
+        try:
+          total += float(amount.get("value") or 0)
+        except (TypeError, ValueError):
+          continue
+    page = payload.get("next_page") if payload.get("has_more") else None
+    if not page:
+      break
+  return total
+
+
 def get_json(url: str, key: str, account_id: str = "") -> dict[str, Any]:
   # opencode asks clients to identify themselves, and Cloudflare in front of
   # opencode.ai answers a bare Python-urllib user agent with 403 before the key
@@ -702,6 +803,7 @@ REMOTE_FETCHERS = {
   "openrouter": fetch_openrouter,
   "opencode-go": fetch_opencode_go_limits,
   "openai": fetch_openai_limits,
+  "openai-api": fetch_openai_api_spend,
 }
 
 
