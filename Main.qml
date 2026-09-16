@@ -227,28 +227,42 @@ Item {
     return sortProviders(result)
   }
 
-  // The order cards appear in when settings.providers says nothing. The shell
-  // does not merge a manifest's barWidget.defaults into a widget's settings, so
-  // this list — not the manifest — is what a fresh install actually renders.
-  // Setting `providers` replaces it. Anything unlisted follows alphabetically,
-  // so a provider discovered from opencode still shows up unconfigured.
-  readonly property var defaultProviderOrder: [
-    "fireworks", "openai", "deepseek", "opencode-go", "openrouter", "claude"
-  ]
+  // The list reads subscriptions first, then prepaid accounts, each
+  // alphabetically. A subscription is already paid for — not using it wastes
+  // it — while a prepaid balance only ever costs what you spend. So the things
+  // you can lose float to the top.
+  //
+  // The rank is read off the record, not from a list, so a card moves between
+  // groups on its own the day it starts reporting something new, and a provider
+  // this plugin has never heard of lands in the right place.
+  function providerRank(p) {
+    if (p.limits && p.limits.length > 0) return 0
+    if (p.balance) return 1
+    return 2
+  }
 
-  // Cards read in the order the subscriptions were configured, so the ones
-  // that matter sit at the top of the column.
+  // `order` is the escape hatch for when the default is not what you want: an
+  // explicit array of provider ids, listed first in that order, with everything
+  // else falling back to the groups above.
   function sortProviders(list) {
-    var declared = settings && settings.providers ? Object.keys(settings.providers) : []
-    var order = declared.length > 0 ? declared : defaultProviderOrder
+    var declared = setting("order", [])
     var rank = {}
-    for (var i = 0; i < order.length; i++) rank[order[i]] = i
+    if (Array.isArray(declared))
+      for (var i = 0; i < declared.length; i++) rank[String(declared[i])] = i
+
     var sorted = list.slice()
     sorted.sort(function(a, b) {
-      var ra = rank[a.providerId] === undefined ? order.length : rank[a.providerId]
-      var rb = rank[b.providerId] === undefined ? order.length : rank[b.providerId]
-      if (ra !== rb) return ra - rb
-      return a.providerId < b.providerId ? -1 : (a.providerId > b.providerId ? 1 : 0)
+      var da = rank[a.providerId] === undefined ? -1 : rank[a.providerId]
+      var db = rank[b.providerId] === undefined ? -1 : rank[b.providerId]
+      if (da !== db) return da - db
+
+      var ga = providerRank(a)
+      var gb = providerRank(b)
+      if (ga !== gb) return ga - gb
+
+      var na = String(a.providerName || a.providerId)
+      var nb = String(b.providerName || b.providerId)
+      return na < nb ? -1 : (na > nb ? 1 : 0)
     })
     return sorted
   }

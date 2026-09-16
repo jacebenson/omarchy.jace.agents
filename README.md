@@ -20,8 +20,12 @@ clone.
 
 ## Panel
 
-- **One row per subscription**, in the order the providers are listed in
-  settings, each with its mark, its name, and its plan underneath.
+- **One row per subscription**, each with its mark, its name, and its plan
+  underneath. Subscriptions come first, then prepaid accounts, each group
+  alphabetical — a subscription is paid for whether or not you use it, while a
+  prepaid balance only costs what you spend. The grouping is read off each
+  record, so a card moves between groups on its own the day it starts reporting
+  something new. Set the `order` key to an array of provider ids to override it.
 - **Prepaid accounts** show what is left and what has been spent, with a meter
   that drains toward empty.
 - **Subscriptions** show one line per rolling window (`5h`, `7d`, `30d`): a bar,
