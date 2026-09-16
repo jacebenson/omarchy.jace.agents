@@ -233,6 +233,9 @@ Item {
   // the same way a usage record does.
   readonly property string cardConfigPath: (Quickshell.env("XDG_CONFIG_HOME") || home + "/.config") + "/omarchy/agents/opencode.json"
   property var providerOrder: []
+  // Cards collapsed to a mark by hand, whatever they have to report. The
+  // row/button split is otherwise derived, so this is the override.
+  property var hiddenProviders: []
 
   FileView {
     id: cardConfigFile
@@ -241,7 +244,7 @@ Item {
     printErrors: false
     onFileChanged: reload()
     onLoaded: root.applyCardConfig(text())
-    onLoadFailed: root.providerOrder = []
+    onLoadFailed: { root.providerOrder = []; root.hiddenProviders = [] }
   }
 
   function applyCardConfig(content) {
@@ -249,6 +252,8 @@ Item {
     try { parsed = JSON.parse(String(content || "")) } catch (e) { parsed = null }
     var order = parsed && parsed.order
     providerOrder = Array.isArray(order) ? order.map(String) : []
+    var hidden = parsed && parsed.hidden
+    hiddenProviders = Array.isArray(hidden) ? hidden.map(String) : []
   }
 
   // The list reads subscriptions first, then prepaid accounts, each

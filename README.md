@@ -90,7 +90,7 @@ there from the first frame and their numbers fill in.
 | OpenAI | 5h + 7d, from the ChatGPT backend | — | opencode (`openai`, `codex` folded in) |
 | DeepSeek | — | live, `api.deepseek.com/user/balance` | opencode |
 | OpenCode Go | 5h + 7d + 30d, from `opencode.ai/zen/go/v1/usage` | — | opencode (`opencode-go`) |
-| OpenCode Zen | none published | none published | opencode (`opencode`) |
+| OpenCode Zen | — | estimated from opencode's own records | opencode (`opencode`) |
 | OpenRouter | — | live, `openrouter.ai/api/v1/credits` | opencode |
 | Fireworks | — | estimated (upstream; needs `fundedAmount`) | opencode |
 | Claude Code | 5h + 7d, from Anthropic's OAuth endpoint | — | upstream |
@@ -178,9 +178,14 @@ never want it, the scan is the expensive part of this collector and could go.
 
 ### Known limits
 
-- **OpenCode Zen publishes no balance or usage API.** `zen/v1/balance` and
-  `zen/v1/usage` both 404; an open feature request tracks it. Zen can report
-  what it spent but not what is left.
+- **No dashboard here is readable by a key.** OpenCode Zen's balance (a Stripe
+  customer credit rendered into the console page), Fireworks' credits and
+  Replicate's balance all sit behind session-cookie endpoints — the keys this
+  plugin holds are deliberately narrower. Zen and Fireworks therefore *estimate*
+  (you supply the balance you can see; the spend comes from opencode's records
+  or Fireworks' billing API), Replicate stays a plain link, and none of it is a
+  live ledger. `zen/v1/balance` and `zen/v1/usage` are 404; an open feature
+  request tracks the former.
 - **GitHub Copilot's quota is not reachable here.** The usage endpoint requires
   a Copilot-entitled GitHub token, and no Copilot credential is stored by
   opencode on this machine.
@@ -192,6 +197,63 @@ never want it, the scan is the expensive part of this collector and could go.
   models counts all of its tokens toward the model it ended on.
 - **opencode.ai sits behind Cloudflare and rejects a bare `Python-urllib` user
   agent** with 403. The collector identifies itself, as opencode's docs ask.
+
+## Configuring a card
+
+Clicking a card opens it, and everything inside writes to the plugin's own
+config through the collector — the panel never builds JSON or touches a path:
+
+| Action | Writes |
+|---|---|
+| **Open …'s billing page** | opens it in your browser (no write) |
+| **Funded** | `fundedAmount` + `fundedAt` for an estimated balance |
+| **Move to top / bottom** | `order` |
+| **Hide / Show** | `hidden` |
+
+`~/.config/omarchy/agents/opencode.json`:
+
+```jsonc
+{
+  "providers": { "github-copilot": { "enabled": false } },
+  "order": ["openai", "opencode-go", "deepseek"],
+  "hidden": ["replicate"],
+  "fundedAmount": 20.0,
+  "fundedAt": "2026-09-16"
+}
+```
+
+**Funded** is the *balance you can see*, not the total you ever paid in, and
+`fundedAt` moves to today every time you save it. That is what keeps the spend
+window short — Fireworks' billing endpoint returns 503 for a long one — and what
+stops a later top-up from subtracting everything spent since the first time you
+typed a number.
+
+**Hide** collapses a card to a mark in the bottom row even when it has a figure;
+**Show** brings it back. A mark with no figure has nothing to return to, so it
+offers no Show and has to earn one first.
+
+## Adding a provider
+
+1. **A provider opencode knows**: sign in *in opencode* — `opencode auth login`,
+   or `/connect` in the TUI. A card appears on its own; there is nothing to
+   configure here.
+2. **Claude Code** is not an opencode thing: its card is built by the upstream
+   collector from `claude auth login`. Run that and its 5h/7d windows appear.
+3. **A provider this plugin has never seen** still appears — a card is created
+   from whatever providerID opencode records, named after the id. Rename it (or
+   fold it onto another card) in `providers` above.
+
+Keys resolve in this order, first hit wins:
+
+```
+$DEEPSEEK_API_KEY / $OPENROUTER_API_KEY / $OPENCODE_GO_API_KEY
+  -> ~/.config/omarchy/agents/<provider>.json   { "apiKey": "..." }
+    -> opencode's ~/.local/share/opencode/auth.json
+```
+
+So an explicit key needs no code and no UI: it wins over opencode's. Note that
+OpenAI's card is the exception — it reads opencode's **OAuth** credential (or
+`~/.codex/auth.json`), because a ChatGPT subscription has no API key.
 
 ## Settings
 

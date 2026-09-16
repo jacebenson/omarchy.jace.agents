@@ -31,8 +31,17 @@ Panel {
   // mark, because a row of empty space says less than a logo that opens the page
   // where the number actually lives. That split is computed, not configured: the
   // day one of them grows an API, its button becomes a row on its own.
-  readonly property var meteredProviders: providers.filter(function(p) { return hasFigure(p) })
-  readonly property var linkedProviders: providers.filter(function(p) { return !hasFigure(p) })
+  readonly property var meteredProviders: providers.filter(function(p) { return hasFigure(p) && !isHidden(p) })
+  readonly property var linkedProviders: providers.filter(function(p) { return !hasFigure(p) || isHidden(p) })
+
+  function isHidden(p) {
+    return !!p && usage.hiddenProviders.indexOf(p.providerId) !== -1
+  }
+
+  // Hiding is only offered where it can be undone, and showing only where there
+  // is a figure to show: a mark with nothing to report has no card to return to.
+  function canHide(p) { return hasFigure(p) && !isHidden(p) }
+  function canShow(p) { return hasFigure(p) && isHidden(p) }
 
   function hasFigure(p) {
     return !!p && ((p.limits && p.limits.length > 0) || !!p.balance)
@@ -90,7 +99,7 @@ Panel {
   // providers whose figure is derived from it, and nowhere else. A provider
   // that can read its real ledger already has the answer; a provider whose
   // collector never reads this file would be showing a field that does nothing.
-  readonly property var fundedAmountProviders: ["fireworks"]
+  readonly property var fundedAmountProviders: ["fireworks", "opencode"]
 
   function needsFundedAmount(p) {
     if (!p || fundedAmountProviders.indexOf(p.providerId) === -1) return false
@@ -165,6 +174,25 @@ Panel {
 
   Process {
     id: setOrderProcess
+    running: false
+    onExited: function(code) { if (code !== 0) root.orderError = "Could not save" }
+  }
+
+  function setHidden(p, hidden) {
+    if (!p || root.collectorPath === "") return
+    var ids = []
+    for (var i = 0; i < providers.length; i++) {
+      var id = providers[i].providerId
+      var shouldHide = id === p.providerId ? hidden : isHidden(providers[i])
+      if (shouldHide) ids.push(id)
+    }
+    orderError = ""
+    setHiddenProcess.command = [root.collectorPath, "--set-hidden", ids.join(",")]
+    setHiddenProcess.running = true
+  }
+
+  Process {
+    id: setHiddenProcess
     running: false
     onExited: function(code) { if (code !== 0) root.orderError = "Could not save" }
   }
@@ -350,15 +378,21 @@ Panel {
   function subText(p) {
     if (!p) return ""
     if (String(p.usageStatusText || "") !== "") return p.usageStatusText
-    var b = p.balance
-    if (b && b.funded > 0) {
-      // A credit balance is what says "prepaid", so the word is dropped and the
-      // money keeps its room: an elided "of $90…" reads as $90 or $900.
-      return formatMoney(b.spent, b.currency) + " spent of " + formatMoney(b.funded, b.currency)
-    }
+
     var tier = String(p.tierLabel || "")
     if (tier === "") tier = "Subscription"
-    return tier.charAt(0).toUpperCase() + tier.slice(1)
+    tier = tier.charAt(0).toUpperCase() + tier.slice(1)
+
+    var b = p.balance
+    if (!b) return tier
+    // A window and a credit at once: the windows own the trailing space, so the
+    // credit is stated here instead of being dropped.
+    if (p.limits && p.limits.length > 0) return tier + " · " + balanceText(b) + " credit"
+    // A funded figure is what says "prepaid", so the word is dropped and the
+    // money keeps its room: an elided "of $90…" reads as $90 or $900.
+    if (b.funded > 0)
+      return formatMoney(b.spent, b.currency) + " spent of " + formatMoney(b.funded, b.currency)
+    return tier
   }
 
   // Marks resolve by convention, so a new agent's data file needs nothing from
@@ -696,19 +730,25 @@ Panel {
     // a lot of machinery for a list this short, and this needs no tutorial.
     Row {
       id: moveRow
-      visible: topButton.visible || bottomButton.visible
       width: parent.width
       spacing: Style.spacing.md
 
+      // The row decides from the same source the buttons do, rather than from
+      // the buttons' own `visible`: a row that reads its children's visibility
+      // evaluates before they do and stays hidden for good.
+      readonly property bool canTop: root.canMoveToTop(providerDetails.provider)
+      readonly property bool canBottom: root.canMoveToBottom(providerDetails.provider)
       // One button gets the full width; there is no empty half to leave behind.
-      readonly property int visibleCount: (topButton.visible ? 1 : 0) + (bottomButton.visible ? 1 : 0)
+      readonly property int visibleCount: (canTop ? 1 : 0) + (canBottom ? 1 : 0)
       readonly property real cellWidth: visibleCount > 0
         ? (width - spacing * (visibleCount - 1)) / visibleCount
         : 0
 
+      visible: visibleCount > 0
+
       Button {
         id: topButton
-        visible: root.canMoveToTop(providerDetails.provider)
+        visible: moveRow.canTop
         width: visible ? moveRow.cellWidth : 0
         text: "Move to top"
         foreground: root.foreground
@@ -720,7 +760,7 @@ Panel {
 
       Button {
         id: bottomButton
-        visible: root.canMoveToBottom(providerDetails.provider)
+        visible: moveRow.canBottom
         width: visible ? moveRow.cellWidth : 0
         text: "Move to bottom"
         foreground: root.foreground
@@ -728,6 +768,37 @@ Panel {
         fontSize: Style.font.bodySmall
         verticalPadding: Style.space(4)
         onClicked: root.moveProvider(providerDetails.provider, false)
+      }
+    }
+
+    Row {
+      id: visibilityRow
+      visible: root.canHide(providerDetails.provider) || root.canShow(providerDetails.provider)
+      width: parent.width
+      spacing: Style.spacing.md
+
+      Button {
+        id: hideButton
+        visible: root.canHide(providerDetails.provider)
+        width: visible ? visibilityRow.width : 0
+        text: "Hide"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        fontSize: Style.font.bodySmall
+        verticalPadding: Style.space(4)
+        onClicked: root.setHidden(providerDetails.provider, true)
+      }
+
+      Button {
+        id: showButton
+        visible: root.canShow(providerDetails.provider)
+        width: visible ? visibilityRow.width : 0
+        text: "Show"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        fontSize: Style.font.bodySmall
+        verticalPadding: Style.space(4)
+        onClicked: root.setHidden(providerDetails.provider, false)
       }
     }
 
@@ -818,9 +889,13 @@ Panel {
     // The active block on the right. A row only exists when it has a figure, so
     // this is either the balance or the window list; a status line takes the
     // name column instead and leaves this empty.
+    // A card can legitimately have both a rolling window and a credit balance
+    // (a ChatGPT plan with usage credits). The windows are the thing that stops
+    // you, so they keep the trailing space and the credit moves up under the
+    // name, where it still reads as a second, smaller fact.
     readonly property var trailingBlock: hasStatus
       ? null
-      : (balance ? balanceBlock : windowColumn)
+      : (limits.length > 0 ? windowColumn : balanceBlock)
 
     width: parent ? parent.width : implicitWidth
     implicitHeight: summary.implicitHeight + (details.visible ? details.height + Style.spacing.md : 0)

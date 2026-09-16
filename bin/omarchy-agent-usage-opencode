@@ -169,6 +169,9 @@ def blank_stats(dates: list[str]) -> dict[str, Any]:
     "sessionIds": set(),
     "prompts": 0,
     "activeDates": set(),
+    # What opencode recorded these steps as costing, by local day. Only used to
+    # estimate a balance for a provider whose own ledger we cannot read.
+    "costByDay": {},
   }
 
 
@@ -371,7 +374,13 @@ def scan_database(today: str, cards: dict[str, dict[str, Any]]) -> dict[str, dic
         cache_read = number(cache.get("read"))
         cache_write = number(cache.get("write"))
         total = input_tokens + output_tokens + cache_read + cache_write
-        if total <= 0:
+        # A step can carry a cost without carrying tokens we count; keep it
+        # either way, because the cost is what an estimate spends.
+        try:
+          cost = float(entry.get("cost") or 0)
+        except (TypeError, ValueError):
+          cost = 0.0
+        if total <= 0 and cost <= 0:
           continue
       except Exception:
         continue
@@ -382,6 +391,8 @@ def scan_database(today: str, cards: dict[str, dict[str, Any]]) -> dict[str, dic
       stats["totalSteps"] += 1
       stats["sessionIds"].add(session_id)
       stats["activeDates"].add(day)
+      if cost > 0:
+        stats["costByDay"][day] = stats["costByDay"].get(day, 0.0) + cost
 
       bucket = stats["modelUsage"].setdefault(model, empty_bucket())
       bucket["inputTokens"] += input_tokens
@@ -651,12 +662,41 @@ def fetch_openai_limits() -> tuple[dict[str, Any], str]:
   plan = str(payload.get("plan_type") or "").strip()
   if plan:
     overrides["tierLabel"] = plan.capitalize()
+
+  # ChatGPT/Codex usage credits ride along on the same response. They are not
+  # the API platform's prepaid credits — a different wallet entirely — and they
+  # are only worth a line when there is actually credit: "has_credits: false"
+  # is an absence, not a balance of zero dollars.
+  credits = payload.get("credits")
+  if isinstance(credits, dict) and credits.get("has_credits") is True:
+    try:
+      remaining = float(credits.get("balance") or 0)
+    except (TypeError, ValueError):
+      remaining = None
+    if remaining is not None:
+      # funded stays 0: we know what is left and nothing about what was put in,
+      # so the card shows the figure without pretending to a meter.
+      overrides["balance"] = {
+        "remaining": remaining,
+        "funded": 0.0,
+        "spent": 0.0,
+        "currency": "USD",
+        "estimated": False,
+      }
   return overrides, ""
 
 
 # What each card is worth beyond its opencode session history. A funded key or
 # a live subscription earns a card even on a machine that has never run a
 # session through opencode for it.
+# Cards whose remaining balance is estimated from opencode's own records rather
+# than read from a provider API: you supply the balance you can see, opencode
+# supplies the spend. Replicate is deliberately absent — its API carries no cost
+# field at all, so there would be nothing to subtract.
+LOCAL_ESTIMATE_CARDS = ("opencode",)
+
+# A provider's worth can be a credit ledger or a set of rolling windows; either
+# one earns a card even with no local session history.
 REMOTE_FETCHERS = {
   "deepseek": fetch_deepseek,
   "openrouter": fetch_openrouter,
@@ -731,6 +771,7 @@ def deserialize_stats(cached: Any) -> dict[str, Any]:
       "recentByDay": entry.get("recentByDay") or {},
       "todayTokensByModel": entry.get("todayTokensByModel") or {},
       "modelUsage": entry.get("modelUsage") or {},
+      "costByDay": entry.get("costByDay") or {},
       "totalSteps": number(entry.get("totalSteps")),
       "prompts": number(entry.get("prompts")),
       "todayPrompts": number(entry.get("todayPrompts")),
@@ -799,6 +840,8 @@ def merge_stats(entries: list[dict[str, Any]], dates: list[str]) -> dict[str, An
       merged["todayTokensByModel"][model] = merged["todayTokensByModel"].get(model, 0) + number(tokens)
     for day, tokens in (entry.get("recentByDay") or {}).items():
       merged["recentByDay"][day] = merged["recentByDay"].get(day, 0) + number(tokens)
+    for day, cost in (entry.get("costByDay") or {}).items():
+      merged["costByDay"][day] = merged["costByDay"].get(day, 0.0) + float(cost or 0)
     for model, bucket in (entry.get("modelUsage") or {}).items():
       target = merged["modelUsage"].setdefault(model, empty_bucket())
       for key in target:
@@ -898,6 +941,27 @@ def build_records(stats: dict[str, Any], dates: list[str], only: list[str], excl
       records[card_id]["usageStatusText"] = "Unavailable"
       records[card_id]["authHelpText"] = status
 
+  # A prepaid provider whose ledger we cannot read still gets a figure: you
+  # supply the balance, opencode's own records supply the spend.
+  for card_id in LOCAL_ESTIMATE_CARDS:
+    if card_id in disabled or not wanted(card_id, only, excluded):
+      continue
+    entries = [stats[pid] for pid in stats if cards.get(pid, {}).get("id") == card_id]
+    merged = entries[0] if len(entries) == 1 else merge_stats(entries, dates)
+    balance = estimate_balance(card_id, merged)
+    if balance is None:
+      continue
+    if card_id not in records:
+      description = cards.get(card_id, {})
+      records[card_id] = record_from_stats(
+        card_id,
+        str(description.get("name") or card_id),
+        str(description.get("tierLabel") or "Prepaid"),
+        merged,
+        dates,
+      )
+    records[card_id]["balance"] = balance
+
   # Every card that is switched on gets a record even when it has nothing to
   # report yet. A provider we can spend money on but not read collapses to a
   # linked button on the panel side, and a button needs a record to exist — so
@@ -954,14 +1018,12 @@ def set_funded(provider_id: str, raw_amount: str) -> int:
   path = config_home() / "omarchy" / "agents" / f"{provider_id}.json"
   config = read_json(path)
   config["fundedAmount"] = round(amount, 2)
-  # The date is not decoration: it bounds the window the spend is summed over,
-  # and the billing endpoint only answers for a moderate one — it returns 503
-  # for a window as long as the account's life. Defaulting to today also states
-  # the honest prepaid model, "what is left of what I put in this period". An
-  # existing date is kept so a top-up adds to the total without moving the
-  # period.
-  if not str(config.get("fundedAt") or "").strip():
-    config["fundedAt"] = datetime.now().strftime("%Y-%m-%d")
+  # The value means "the balance I can see right now", so the date means "as of
+  # when I told you" — and it moves to today on every save. That keeps the spend
+  # window short and bounded (the billing endpoint 503s on long ones), and it
+  # stops a later top-up from double-subtracting everything spent since the
+  # first time you typed a number.
+  config["fundedAt"] = datetime.now().strftime("%Y-%m-%d")
 
   try:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -989,9 +1051,6 @@ def set_order(raw_ids: str) -> int:
   the panel decides the sequence and this only validates and writes it.
   """
   ids = [part.strip() for part in str(raw_ids or "").split(",") if part.strip()]
-  if not ids:
-    print("omarchy-agent-usage-opencode: refusing to write an empty order", file=sys.stderr)
-    return 2
   for provider_id in ids:
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", provider_id):
       print(f"omarchy-agent-usage-opencode: refusing suspicious provider id {provider_id!r}", file=sys.stderr)
@@ -999,7 +1058,11 @@ def set_order(raw_ids: str) -> int:
 
   path = card_config_path()
   config = read_json(path)
-  config["order"] = ids
+  # An empty list is not a refusal: it is "no custom order", so the key goes.
+  if ids:
+    config["order"] = ids
+  else:
+    config.pop("order", None)
 
   try:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1009,6 +1072,66 @@ def set_order(raw_ids: str) -> int:
     return 2
 
   print(json.dumps({"order": ids}))
+  return 0
+
+
+def estimate_balance(card_id: str, stats: dict[str, Any]) -> dict[str, Any] | None:
+  """What is left of a balance only you can see, minus what has been spent.
+
+  This is the Fireworks arrangement with a different source for the spend: that
+  one asks a billing API, this one adds up what opencode itself recorded for
+  each finished step. The dated window matters for the same reason — it is what
+  keeps the number from double-subtracting a top-up.
+  """
+  config = read_json(config_home() / "omarchy" / "agents" / f"{card_id}.json")
+  try:
+    funded = float(config.get("fundedAmount") or 0)
+  except (TypeError, ValueError):
+    return None
+  if not math.isfinite(funded) or funded <= 0:
+    return None
+
+  funded_at = str(config.get("fundedAt") or "").strip()
+  cost_by_day = stats.get("costByDay") or {}
+  # Dates are ISO, so the comparison is the ordering.
+  spent = sum(cost for day, cost in cost_by_day.items() if not funded_at or str(day) >= funded_at)
+  return {
+    "remaining": round(funded - spent, 2),
+    "funded": funded,
+    "spent": round(spent, 2),
+    "currency": "USD",
+    "estimated": True,
+  }
+
+
+def set_hidden(raw_ids: str) -> int:
+  """Record which cards are collapsed to a mark in the bottom row.
+
+  The row/button split is derived from whether a card has a figure to show, so
+  this is the manual override: hide a card that does have one, or bring a hidden
+  one back. An empty list clears the override.
+  """
+  ids = [part.strip() for part in str(raw_ids or "").split(",") if part.strip()]
+  for provider_id in ids:
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", provider_id):
+      print(f"omarchy-agent-usage-opencode: refusing suspicious provider id {provider_id!r}", file=sys.stderr)
+      return 2
+
+  path = card_config_path()
+  config = read_json(path)
+  if ids:
+    config["hidden"] = ids
+  else:
+    config.pop("hidden", None)
+
+  try:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, config)
+  except OSError as error:
+    print(f"omarchy-agent-usage-opencode: could not write {path} ({error})", file=sys.stderr)
+    return 2
+
+  print(json.dumps({"hidden": ids}))
   return 0
 
 
@@ -1039,6 +1162,8 @@ def main() -> int:
                       help="Record how much has been funded for an estimated balance, then exit")
   parser.add_argument("--set-order", default=None, metavar="ID,ID,...",
                       help="Record the order the cards are drawn in, then exit")
+  parser.add_argument("--set-hidden", default=None, metavar="ID,ID,...",
+                      help="Record which cards are collapsed to a mark, then exit")
   parser.add_argument("cards", nargs="*")
   args = parser.parse_args()
 
@@ -1047,6 +1172,8 @@ def main() -> int:
     return set_funded(str(args.set_funded[0]), str(args.set_funded[1]))
   if args.set_order is not None:
     return set_order(str(args.set_order))
+  if args.set_hidden is not None:
+    return set_hidden(str(args.set_hidden))
 
   only = [str(card) for card in args.cards if str(card)]
   excluded = {str(card) for card in args.excluded}
