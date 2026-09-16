@@ -43,7 +43,7 @@ Panel {
   // a dashboard is in the same place for everyone.
   function billingUrl(providerId) {
     var urls = {
-      "codex": "https://chatgpt.com/?openaicom_referred=true#settings/Usage",
+      "openai": "https://chatgpt.com/?openaicom_referred=true#settings/Usage",
       "deepseek": "https://platform.deepseek.com/usage",
       "opencode-go": "https://opencode.ai/auth",
       "openrouter": "https://openrouter.ai/settings/credits",

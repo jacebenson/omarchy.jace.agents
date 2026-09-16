@@ -217,5 +217,6 @@ also skipped when the records regenerate.
 `assets/<id>.svg` is the mark for dark surfaces, with an `assets/<id>-light.svg`
 twin for light ones; a brand-coloured mark that works on both ships one file.
 A missing mark is not an error — the bar glyph stands in. The DeepSeek,
-OpenRouter, OpenCode, and GitHub Copilot marks come from
-[Simple Icons](https://simpleicons.org) (CC0).
+OpenRouter, OpenCode, GitHub Copilot, and Replicate marks come from
+[Simple Icons](https://simpleicons.org) (CC0). Simple Icons no longer ships the
+OpenAI mark, so that one comes from [thesvg.org](https://thesvg.org/icon/openai).

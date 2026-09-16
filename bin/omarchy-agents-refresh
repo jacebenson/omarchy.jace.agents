@@ -42,11 +42,11 @@ upstream_pid=""
 
 if command -v omarchy-agent-usage-update >/dev/null 2>&1; then
   upstream_args=("$@")
-  # One writer per record. This collector builds the codex card, because
-  # opencode's own Codex sign-in can read the subscription's windows even when
-  # the Codex CLI cannot. Standing the upstream codex collector down keeps the
-  # two from blanking each other's file. When this collector is unavailable it
-  # is left enabled, so the card still exists.
+  # One writer per record. This collector builds the OpenAI card (opencode's
+  # Codex sign-in can read the subscription's windows even when the Codex CLI
+  # cannot), so upstream's codex collector — the agent name, not our card id —
+  # is stood down to keep the two from blanking each other's file. When this
+  # collector is unavailable the exclusion is skipped, so the card still exists.
   (( collector_available )) && upstream_args=(--except codex "${upstream_args[@]}")
   omarchy-agent-usage-update "${upstream_args[@]}" &
   upstream_pid=$!

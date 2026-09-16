@@ -88,7 +88,7 @@ LIMITS_ONLY_REUSE_SECONDS = 900
 CARD_DEFAULTS = {
   "deepseek": {"name": "DeepSeek", "tierLabel": "Prepaid"},
   "opencode-go": {"name": "OpenCode", "tierLabel": "Go + Zen"},
-  "codex": {"name": "Codex", "tierLabel": "Subscription"},
+  "openai": {"name": "OpenAI", "tierLabel": "Subscription"},
   "github-copilot": {"name": "GitHub Copilot", "tierLabel": "Subscription"},
   "openrouter": {"name": "OpenRouter", "tierLabel": "Prepaid"},
   "replicate": {"name": "Replicate", "tierLabel": "Prepaid"},
@@ -100,18 +100,18 @@ CARD_DEFAULTS = {
 # Already covered by an upstream collector. Fireworks has its own billing-API
 # collector and its own record; Anthropic is counted from its native CLI
 # sessions by the claude collector. Emitting them here too would show every one
-# of those tokens twice. OpenAI is NOT in this list: the codex card is built
+# of those tokens twice. OpenAI is NOT in this list: the OpenAI card is built
 # here from opencode's `openai` sessions and the ChatGPT backend's windows, and
 # the wrapper tells the upstream codex collector to stand down so the two never
 # write the same file.
 UPSTREAM_PROVIDER_IDS = {"fireworks-ai", "anthropic"}
 
 # providerIDs that are really another card's account. opencode's `openai`
-# providerID is the Codex subscription, so its sessions land on the codex card.
-# Zen folds onto the Go card because they are one product to a user: Go is a
-# subscription with rolling windows, Zen is a credit balance with no API at
-# all, and a row that can only ever say "balance unavailable" is noise.
-CARD_FOLDS = {"openai": "codex", "opencode": "opencode-go"}
+# providerID IS the card; a `codex` providerID, if one ever appears, belongs on
+# the same card, because both names describe one ChatGPT subscription. Zen folds
+# onto the Go card: one product to a user, and a row that could only ever say
+# "balance unavailable" is noise.
+CARD_FOLDS = {"codex": "openai", "opencode": "opencode-go"}
 
 # Local endpoints and free tiers: nothing to subscribe to, nothing to track.
 # Replicate is NOT here: it is a paid account with no usage API, and the panel
@@ -609,8 +609,12 @@ def openai_oauth() -> tuple[str, str]:
   return str(tokens.get("access_token") or "").strip(), str(tokens.get("account_id") or "").strip()
 
 
-def fetch_codex_limits() -> tuple[dict[str, Any], str]:
-  """The Codex subscription's rolling windows, for either sign-in."""
+def fetch_openai_limits() -> tuple[dict[str, Any], str]:
+  """The OpenAI subscription's rolling windows, from either sign-in.
+
+  These are the same windows the Codex CLI calls its own: `codex` is the client,
+  OpenAI is the account, and the card is named for the account.
+  """
   access, account = openai_oauth()
   if not access:
     return {}, "Connect Codex in opencode, or run `codex login`, to read its limits."
@@ -652,7 +656,7 @@ REMOTE_FETCHERS = {
   "deepseek": fetch_deepseek,
   "openrouter": fetch_openrouter,
   "opencode-go": fetch_opencode_go_limits,
-  "codex": fetch_codex_limits,
+  "openai": fetch_openai_limits,
 }
 
 

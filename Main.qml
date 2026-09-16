@@ -233,7 +233,7 @@ Item {
   // Setting `providers` replaces it. Anything unlisted follows alphabetically,
   // so a provider discovered from opencode still shows up unconfigured.
   readonly property var defaultProviderOrder: [
-    "fireworks", "codex", "deepseek", "opencode-go", "openrouter", "claude"
+    "fireworks", "openai", "deepseek", "opencode-go", "openrouter", "claude"
   ]
 
   // Cards read in the order the subscriptions were configured, so the ones
