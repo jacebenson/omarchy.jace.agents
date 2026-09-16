@@ -74,6 +74,51 @@ Panel {
     expandedProviderId = expandedProviderId === String(providerId) ? "" : String(providerId)
   }
 
+  property string fundedError: ""
+
+  readonly property string collectorPath: localPath(Qt.resolvedUrl("bin/omarchy-agent-usage-opencode"))
+
+  function localPath(url) {
+    var text = String(url || "")
+    if (text.indexOf("file://") !== 0) return text
+    return decodeURIComponent(text.substring(7))
+  }
+
+  // The funded amount is not a balance — it is the half of an *estimated*
+  // balance that only you know: what you put in. So it belongs on exactly the
+  // providers whose figure is derived from it, and nowhere else. A provider
+  // that can read its real ledger already has the answer; a provider whose
+  // collector never reads this file would be showing a field that does nothing.
+  readonly property var fundedAmountProviders: ["fireworks"]
+
+  function needsFundedAmount(p) {
+    if (!p || fundedAmountProviders.indexOf(p.providerId) === -1) return false
+    // A live ledger takes over the moment there is one: the estimate is a
+    // fallback, so the field goes away rather than offering a second opinion.
+    return !p.balance || p.balance.estimated === true
+  }
+
+  // The collector owns these config files, so the panel asks it to write and
+  // then refreshes. One writer, no JSON and no paths in the UI.
+  function saveFundedAmount(providerId, amount) {
+    if (providerId === "" || root.collectorPath === "") return
+    fundedError = ""
+    setFundedProcess.command = [root.collectorPath, "--set-funded", providerId, amount]
+    setFundedProcess.running = true
+  }
+
+  Process {
+    id: setFundedProcess
+    running: false
+    onExited: function(code) {
+      if (code !== 0) {
+        root.fundedError = "Save failed"
+        return
+      }
+      root.refreshNow()
+    }
+  }
+
   // Countdowns and balances read this instead of Date.now() so the panel keeps
   // telling the truth while it sits open.
   property double nowMs: Date.now()
@@ -229,6 +274,13 @@ Panel {
     return currencyPrefix(currency) + amount.toFixed(2)
   }
 
+  // An estimate wears its caveat on the figure: "~" is the universal "about",
+  // and it survives an elided line where a trailing word does not.
+  function balanceText(b) {
+    if (!b) return ""
+    return (b.estimated ? "~" : "") + formatMoney(b.remaining, b.currency)
+  }
+
   // The line under the name: what this subscription is, and for a prepaid
   // account what it has cost so far. An auth or endpoint problem takes the
   // line over, because that is the more useful thing to know.
@@ -239,8 +291,7 @@ Panel {
     if (b && b.funded > 0) {
       // A credit balance is what says "prepaid", so the word is dropped and the
       // money keeps its room: an elided "of $90…" reads as $90 or $900.
-      var spent = formatMoney(b.spent, b.currency) + " spent of " + formatMoney(b.funded, b.currency)
-      return b.estimated ? spent + " · estimated" : spent
+      return formatMoney(b.spent, b.currency) + " spent of " + formatMoney(b.funded, b.currency)
     }
     var tier = String(p.tierLabel || "")
     if (tier === "") tier = "Subscription"
@@ -461,6 +512,22 @@ Panel {
 
     readonly property string url: root.billingUrl(provider ? provider.providerId : "")
     readonly property string name: provider ? String(provider.providerName || provider.providerId) : ""
+    readonly property bool funded: root.needsFundedAmount(provider)
+
+    // Fill from whatever is already recorded each time the card opens, and
+    // leave it alone while it is open so a refresh cannot wipe out typing.
+    onVisibleChanged: if (visible) fundedField.text = currentFunded()
+
+    function currentFunded() {
+      var b = provider ? provider.balance : null
+      return b && b.funded > 0 ? Number(b.funded).toFixed(2) : ""
+    }
+
+    function commitFunded(text) {
+      var amount = Number(String(text || "").trim())
+      if (!isFinite(amount) || amount < 0) return
+      root.saveFundedAmount(provider ? provider.providerId : "", amount.toFixed(2))
+    }
 
     width: parent ? parent.width : implicitWidth
     topPadding: Style.space(4)
@@ -502,6 +569,63 @@ Panel {
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
         onClicked: root.openBilling(providerDetails.provider)
+      }
+    }
+
+    // The estimate's missing half. This is a payment record, not a balance: it
+    // is the total you have put in, which is what makes `funded − spent`
+    // answerable for a provider whose ledger is dashboard-only.
+    Item {
+      visible: providerDetails.funded
+      width: parent.width
+      implicitHeight: Math.max(fundedLabel.implicitHeight, fundedField.implicitHeight) + Style.space(8)
+
+      Text {
+        id: fundedLabel
+        textFormat: Text.PlainText
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.fundedError !== "" ? root.fundedError : "Funded"
+        color: root.fundedError !== "" ? root.urgent : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        width: Style.space(64)
+        elide: Text.ElideRight
+      }
+
+      TextField {
+        id: fundedField
+        anchors.left: fundedLabel.right
+        anchors.leftMargin: Style.space(6)
+        anchors.right: fundedSave.left
+        anchors.rightMargin: Style.space(6)
+        anchors.verticalCenter: parent.verticalCenter
+        placeholderText: "total put in, e.g. 20.00"
+        foreground: root.foreground
+        font.family: root.fontFamily
+        verticalPadding: Style.space(4)
+        // Standard notation in the C locale: money is written "20.00", not
+        // "20,00", whatever the desktop's locale says.
+        validator: DoubleValidator {
+          bottom: 0
+          top: 1000000
+          decimals: 2
+          locale: "C"
+          notation: DoubleValidator.StandardNotation
+        }
+        onAccepted: providerDetails.commitFunded(text)
+      }
+
+      Button {
+        id: fundedSave
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: "Save"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        fontSize: Style.font.bodySmall
+        verticalPadding: Style.space(4)
+        onClicked: providerDetails.commitFunded(fundedField.text)
       }
     }
   }
@@ -670,9 +794,7 @@ Panel {
             id: balanceValue
             textFormat: Text.PlainText
             anchors.right: parent.right
-            text: providerRow.balance
-              ? root.formatMoney(providerRow.balance.remaining, providerRow.balance.currency)
-              : ""
+            text: root.balanceText(providerRow.balance)
             color: providerRow.balanceAlarming ? root.urgent : root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.title

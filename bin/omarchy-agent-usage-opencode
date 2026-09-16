@@ -38,6 +38,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -922,6 +923,54 @@ def _remote_name(cards: dict[str, dict[str, Any]], card_id: str) -> str:
 # ----------------------------------------------------------------------- main
 
 
+def set_funded(provider_id: str, raw_amount: str) -> int:
+  """Record how much money has been put in, keeping the original funding date.
+
+  `fundedAmount` is the running total across top-ups and `fundedAt` is the day
+  the period started, so a later top-up adds to the amount instead of moving the
+  date — move it and the spend it is measured against drifts with it. Only the
+  provider's own config file is touched; nothing here knows about balances.
+
+  This lives here rather than in the panel so that exactly one component reads
+  and writes these files, and the UI never builds JSON or handles a path.
+  """
+  if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", provider_id):
+    print(f"omarchy-agent-usage-opencode: refusing suspicious provider id {provider_id!r}", file=sys.stderr)
+    return 2
+
+  try:
+    amount = float(raw_amount)
+  except ValueError:
+    print(f"omarchy-agent-usage-opencode: {raw_amount!r} is not a number", file=sys.stderr)
+    return 2
+  if not math.isfinite(amount) or amount < 0:
+    print(f"omarchy-agent-usage-opencode: {raw_amount!r} is not a usable amount", file=sys.stderr)
+    return 2
+
+  path = config_home() / "omarchy" / "agents" / f"{provider_id}.json"
+  config = read_json(path)
+  config["fundedAmount"] = round(amount, 2)
+  # The date is not decoration: it bounds the window the spend is summed over,
+  # and the billing endpoint only answers for a moderate one — it returns 503
+  # for a window as long as the account's life. Defaulting to today also states
+  # the honest prepaid model, "what is left of what I put in this period". An
+  # existing date is kept so a top-up adds to the total without moving the
+  # period.
+  if not str(config.get("fundedAt") or "").strip():
+    config["fundedAt"] = datetime.now().strftime("%Y-%m-%d")
+
+  try:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, config)
+  except OSError as error:
+    print(f"omarchy-agent-usage-opencode: could not write {path} ({error})", file=sys.stderr)
+    return 2
+
+  print(json.dumps({"provider": provider_id, "fundedAmount": config["fundedAmount"],
+                    "fundedAt": config["fundedAt"]}))
+  return 0
+
+
 def prune_folded_records(cards: dict[str, dict[str, Any]]) -> None:
   """Delete records left behind by a fold.
 
@@ -945,8 +994,14 @@ def main() -> int:
   parser.add_argument("--force", action="store_true")
   parser.add_argument("--limits-only", action="store_true")
   parser.add_argument("--except", action="append", default=[], dest="excluded")
+  parser.add_argument("--set-funded", nargs=2, metavar=("PROVIDER", "AMOUNT"), default=None,
+                      help="Record how much has been funded for an estimated balance, then exit")
   parser.add_argument("cards", nargs="*")
   args = parser.parse_args()
+
+  # Writing one config is not a refresh: leave before the database is touched.
+  if args.set_funded:
+    return set_funded(str(args.set_funded[0]), str(args.set_funded[1]))
 
   only = [str(card) for card in args.cards if str(card)]
   excluded = {str(card) for card in args.excluded}
