@@ -636,7 +636,10 @@ def fetch_openai_api_spend() -> tuple[dict[str, Any], str]:
     "funded": funded,
     "spent": round(total, 2),
     "currency": "USD",
-    "estimated": False,
+    # Derived from a figure you supplied, measured against spend — the same
+    # shape as Fireworks, and marked the same way so the card keeps its Balance
+    # field.
+    "estimated": True,
   }}, ""
 
 
@@ -758,15 +761,24 @@ def openai_reset_expiry(access: str, account: str) -> str:
     payload = get_json(OPENAI_RESETS_URL, access, account)
   except OpencodeError:
     return ""
-  soonest = ""
+  soonest: datetime | None = None
+  soonest_text = ""
   for credit in payload.get("credits") or []:
     if not isinstance(credit, dict) or credit.get("status") != "available":
       continue
     expires = str(credit.get("expires_at") or "")
-    # ISO-8601 in UTC, so the ordering is the comparison.
-    if expires and (soonest == "" or expires < soonest):
-      soonest = expires
-  return soonest
+    if not expires:
+      continue
+    try:
+      # Parse rather than compare text: ISO strings with different fractional
+      # precision do not sort chronologically (".842509Z" sorts before "Z").
+      moment = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+    except ValueError:
+      continue
+    if soonest is None or moment < soonest:
+      soonest = moment
+      soonest_text = expires
+  return soonest_text
 
 
 def fetch_openai_limits() -> tuple[dict[str, Any], str]:

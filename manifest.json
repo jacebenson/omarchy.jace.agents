@@ -24,26 +24,35 @@
     "allowMultiple": false,
     "defaults": {
       "providers": {
-        "fireworks": {
+        "openai": {
           "enabled": true
         },
-        "codex": {
+        "openai-api": {
           "enabled": true
         },
-        "deepseek": {
+        "opencode-go": {
           "enabled": true
         },
         "opencode": {
           "enabled": true
         },
-        "github-copilot": {
+        "deepseek": {
           "enabled": true
         },
         "openrouter": {
           "enabled": true
         },
+        "fireworks": {
+          "enabled": true
+        },
         "claude": {
           "enabled": true
+        },
+        "replicate": {
+          "enabled": true
+        },
+        "github-copilot": {
+          "enabled": false
         }
       },
       "refreshIntervalSec": 900,

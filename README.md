@@ -91,7 +91,7 @@ there from the first frame and their numbers fill in.
 | DeepSeek | — | live, `api.deepseek.com/user/balance` | opencode |
 | OpenCode Go | 5h + 7d + 30d, from `opencode.ai/zen/go/v1/usage` | — | opencode (`opencode-go`) |
 | OpenCode Zen | — | estimated from opencode's own records | opencode (`opencode`) |
-| OpenAI API | — | estimated from `organization/costs` *(admin key)* | — |
+| OpenAI API | — | estimated: your balance against `organization/costs` *(admin key)* | — |
 | OpenRouter | — | live, `openrouter.ai/api/v1/credits` | opencode |
 | Fireworks | — | estimated (upstream; needs `fundedAmount`) | opencode |
 | Claude Code | 5h + 7d, from Anthropic's OAuth endpoint | — | upstream |
@@ -207,7 +207,7 @@ config through the collector — the panel never builds JSON or touches a path:
 | Action | Writes |
 |---|---|
 | **Open …'s billing page** | opens it in your browser (no write) |
-| **Funded** | `fundedAmount` + `fundedAt` for an estimated balance |
+| **Balance** | `fundedAmount` + `fundedAt` for an estimated balance |
 | **Move to top / bottom** | `order` |
 | **Hide / Show** | `hidden` |
 

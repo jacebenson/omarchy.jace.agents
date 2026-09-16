@@ -112,9 +112,13 @@ Panel {
 
   function needsFundedAmount(p) {
     if (!p || estimatedBalanceProviders.indexOf(p.providerId) === -1) return false
-    // A live ledger takes over the moment there is one: the estimate is a
-    // fallback, so the field goes away rather than offering a second opinion.
-    return !p.balance || p.balance.estimated === true
+    // No balance yet, or one derived from a figure you supplied: both want the
+    // field. A spend-only balance carries no funded figure, and the field is
+    // exactly how you supply one. The single case that hides it is a live
+    // ledger — a balance with a funded figure behind it and no estimate — where
+    // a typed number would be a second opinion rather than the answer.
+    if (!p.balance) return true
+    return p.balance.estimated === true || Number(p.balance.funded || 0) === 0
   }
 
   // The collector owns these config files, so the panel asks it to write and
@@ -124,6 +128,18 @@ Panel {
     fundedError = ""
     setFundedProcess.command = [root.collectorPath, "--set-funded", providerId, amount]
     setFundedProcess.running = true
+  }
+
+  // Every id this plugin already knows about, rendered or not. A card whose
+  // record disappears for a while must keep whatever was decided about it, or
+  // hiding something else would quietly un-hide it when the record returns.
+  function knownProviderIds() {
+    var ids = []
+    for (var i = 0; i < providers.length; i++) ids.push(providers[i].providerId)
+    var remembered = usage.providerOrder.concat(usage.hiddenProviders)
+    for (var j = 0; j < remembered.length; j++)
+      if (ids.indexOf(remembered[j]) === -1) ids.push(String(remembered[j]))
+    return ids
   }
 
   function providerById(id) {
@@ -176,6 +192,12 @@ Panel {
     }
     ids.splice(insertAt, 0, p.providerId)
 
+    // Anything not currently drawn keeps its place at the end rather than being
+    // dropped from the arrangement.
+    var remembered = root.knownProviderIds()
+    for (var k = 0; k < remembered.length; k++)
+      if (ids.indexOf(remembered[k]) === -1) ids.push(remembered[k])
+
     orderError = ""
     setOrderProcess.command = [root.collectorPath, "--set-order", ids.join(",")]
     setOrderProcess.running = true
@@ -190,10 +212,13 @@ Panel {
   function setHidden(p, hidden) {
     if (!p || root.collectorPath === "") return
     var ids = []
-    for (var i = 0; i < providers.length; i++) {
-      var id = providers[i].providerId
-      var shouldHide = id === p.providerId ? hidden : isHidden(providers[i])
-      if (shouldHide) ids.push(id)
+    var known = root.knownProviderIds()
+    for (var i = 0; i < known.length; i++) {
+      var id = known[i]
+      // Decide from the recorded list, not from an object: an id that is not on
+      // screen right now still has a state to preserve.
+      var wasHidden = usage.hiddenProviders.indexOf(id) !== -1
+      if (id === p.providerId ? hidden : wasHidden) ids.push(id)
     }
     orderError = ""
     setHiddenProcess.command = [root.collectorPath, "--set-hidden", ids.join(",")]
