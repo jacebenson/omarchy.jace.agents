@@ -56,6 +56,7 @@ DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
+OPENAI_RESETS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 # The ChatGPT backend reports a Codex subscription's two rolling windows as the
@@ -746,6 +747,28 @@ def openai_oauth() -> tuple[str, str]:
   return str(tokens.get("access_token") or "").strip(), str(tokens.get("account_id") or "").strip()
 
 
+def openai_reset_expiry(access: str, account: str) -> str:
+  """The soonest expiry among the available rate-limit resets, or "".
+
+  A reset is a way to get more allowance, and it expires — the deadline is the
+  actionable half, and it needs a second call because the usage response only
+  carries the count.
+  """
+  try:
+    payload = get_json(OPENAI_RESETS_URL, access, account)
+  except OpencodeError:
+    return ""
+  soonest = ""
+  for credit in payload.get("credits") or []:
+    if not isinstance(credit, dict) or credit.get("status") != "available":
+      continue
+    expires = str(credit.get("expires_at") or "")
+    # ISO-8601 in UTC, so the ordering is the comparison.
+    if expires and (soonest == "" or expires < soonest):
+      soonest = expires
+  return soonest
+
+
 def fetch_openai_limits() -> tuple[dict[str, Any], str]:
   """The OpenAI subscription's rolling windows, from either sign-in.
 
@@ -783,6 +806,19 @@ def fetch_openai_limits() -> tuple[dict[str, Any], str]:
   plan = str(payload.get("plan_type") or "").strip()
   if plan:
     overrides["tierLabel"] = plan.capitalize()
+
+  # A plan can also hold rate-limit resets: the "Available 2" in ChatGPT's usage
+  # panel. The count rides along on this same response; the expiry is what makes
+  # it actionable, so it is worth the one extra call.
+  resets = payload.get("rate_limit_reset_credits")
+  if isinstance(resets, dict):
+    available = number(resets.get("available_count"))
+    if available > 0:
+      entry: dict[str, Any] = {"available": available}
+      expires = openai_reset_expiry(access, account)
+      if expires:
+        entry["nextExpiresAt"] = expires
+      overrides["resets"] = entry
 
   # ChatGPT/Codex usage credits ride along on the same response. They are not
   # the API platform's prepaid credits — a different wallet entirely — and they

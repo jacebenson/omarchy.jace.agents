@@ -349,6 +349,9 @@ Item {
       // Rate limits and balances stay per-account and are never merged
       // across devices.
       limits: Array.isArray(record.limits) ? record.limits : [],
+      // Per-account, like limits: never merged across devices, and null when the
+      // plan carries none.
+      resets: record.resets && typeof record.resets === "object" ? record.resets : null,
       tierLabel: String(record.tierLabel || ""),
       balance: balanceValue(record.balance),
 

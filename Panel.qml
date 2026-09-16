@@ -619,6 +619,7 @@ Panel {
     readonly property string url: root.billingUrl(provider ? provider.providerId : "")
     readonly property string name: provider ? String(provider.providerName || provider.providerId) : ""
     readonly property bool funded: root.needsFundedAmount(provider)
+    readonly property var resets: provider && provider.resets ? provider.resets : null
 
     // Fill from whatever is already recorded each time the card opens, and
     // leave it alone while it is open so a refresh cannot wipe out typing.
@@ -677,6 +678,27 @@ Panel {
         cursorShape: Qt.PointingHandCursor
         onClicked: root.openBilling(providerDetails.provider)
       }
+    }
+
+    // Rate-limit resets: a way to get more allowance, and one that expires, so
+    // the deadline is stated rather than just the count.
+    Text {
+      textFormat: Text.PlainText
+      visible: providerDetails.resets !== null
+      width: parent.width
+      text: {
+        var r = providerDetails.resets
+        if (!r) return ""
+        var count = Number(r.available || 0)
+        var text = count + (count === 1 ? " reset available" : " resets available")
+        var expires = String(r.nextExpiresAt || "")
+        if (expires !== "") text += " · next expires " + root.shortDate(expires)
+        return text
+      }
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
     }
 
     // The estimate's missing half. This is a payment record, not a balance: it
@@ -823,6 +845,20 @@ Panel {
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
     }
+  }
+
+  // A reset expiry is read at a glance, so: short, and in the reader's own time.
+  function shortDate(iso) {
+    var ms = new Date(String(iso || "")).getTime()
+    if (!isFinite(ms)) return ""
+    var d = new Date(ms)
+    var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    var hour = d.getHours()
+    var suffix = hour >= 12 ? "PM" : "AM"
+    var h12 = hour % 12
+    if (h12 === 0) h12 = 12
+    return months[d.getMonth()] + " " + d.getDate() + ", " + h12 + ":"
+      + String(d.getMinutes()).padStart(2, "0") + " " + suffix
   }
 
   // A provider's mark, or the bar glyph when it ships none. Shared by the rows
