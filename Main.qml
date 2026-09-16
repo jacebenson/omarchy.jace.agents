@@ -317,7 +317,9 @@ Item {
     if (!raw || typeof raw !== "object") return null
     var remaining = Number(raw.remaining)
     var funded = Number(raw.funded)
-    if (!isFinite(remaining) || remaining < 0) return null
+    // A slightly overdrawn account is a valid, useful reading — dropping it
+    // would hide the one number you most want in that state.
+    if (!isFinite(remaining)) return null
     return {
       remaining: remaining,
       funded: isFinite(funded) && funded > 0 ? funded : 0,

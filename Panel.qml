@@ -333,7 +333,8 @@ Panel {
   function formatMoney(value, currency) {
     var amount = Number(value)
     if (!isFinite(amount)) amount = 0
-    return currencyPrefix(currency) + amount.toFixed(2)
+    // A negative ledger reads "-$0.01" rather than "$-0.01".
+    return (amount < 0 ? "-" : "") + currencyPrefix(currency) + Math.abs(amount).toFixed(2)
   }
 
   // An estimate wears its caveat on the figure: "~" is the universal "about",
