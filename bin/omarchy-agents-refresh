@@ -80,6 +80,16 @@ if [[ -n $collector_out && -s $collector_out ]] && jq -e 'type == "object"' "$co
     target="$USAGE_DIR/$card.json"
     payload=$(jq -c --arg card "$card" '.[$card]' "$collector_out") || continue
     [[ -n $payload ]] || continue
+    # Keep the last good data visible across a provider outage. The collector's
+    # unavailable record is still useful as a diagnostic, but replacing a good
+    # quota/balance with an empty error card makes a transient network failure
+    # look like the account disappeared.
+    if [[ -f $target ]] && jq -e '.usageStatusText == "Unavailable"' <<<"$payload" >/dev/null 2>&1; then
+      reason=$(jq -r '.authHelpText // .usageStatusText // "provider unavailable"' <<<"$payload")
+      payload=$(jq -c --arg reason "$reason" '. + {stale: true, staleReason: $reason, staleAt: (now | todateiso8601)}' "$target")
+    else
+      payload=$(jq -c '. + {stale: false}' <<<"$payload")
+    fi
     # Only touch the file when the record actually changed: the panel reloads
     # every record it watches, and a rewrite of identical content would make it
     # redraw every row on every panel open for nothing.

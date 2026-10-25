@@ -55,6 +55,9 @@ SCHEMA_VERSION = 1
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+# The console's own balance endpoint. It is session-authenticated, not key-
+# authenticated; see zen_console() for where the two values come from.
+ZEN_BILLING_URL = "https://opencode.ai/console/api/billing/status"
 OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
 OPENAI_RESETS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -86,17 +89,19 @@ GO_WINDOWS = (
 SCAN_REUSE_SECONDS = 20
 LIMITS_ONLY_REUSE_SECONDS = 900
 
-# providerID -> card. These are only the display name and whether the account
-# is prepaid; the numbers always come from opencode's own accounting.
+# providerID -> card. These are only the display name and the plan level; the
+# numbers always come from opencode's own accounting. tierLabel is a plan
+# ("Go", "Plus"), never a billing category — "Prepaid" and "Subscription" are
+# how the panel groups cards, so a card that has no plan level says nothing.
 CARD_DEFAULTS = {
-  "deepseek": {"name": "DeepSeek", "tierLabel": "Prepaid"},
-  "opencode-go": {"name": "OpenCode Go", "tierLabel": "Subscription"},
-  "opencode": {"name": "OpenCode Zen", "tierLabel": "Prepaid"},
-  "openai": {"name": "OpenAI", "tierLabel": "Subscription"},
+  "deepseek": {"name": "DeepSeek"},
+  "opencode-go": {"name": "OpenCode Go", "tierLabel": "Go"},
+  "opencode": {"name": "OpenCode Zen"},
+  "openai": {"name": "OpenAI"},
   "openai-api": {"name": "OpenAI API", "tierLabel": "API"},
-  "github-copilot": {"name": "GitHub Copilot", "tierLabel": "Subscription"},
-  "openrouter": {"name": "OpenRouter", "tierLabel": "Prepaid"},
-  "replicate": {"name": "Replicate", "tierLabel": "Prepaid"},
+  "github-copilot": {"name": "GitHub Copilot"},
+  "openrouter": {"name": "OpenRouter"},
+  "replicate": {"name": "Replicate"},
 }
 
 # A card can be fed by more than one providerID, and a config entry may fold
@@ -115,11 +120,11 @@ UPSTREAM_PROVIDER_IDS = {"fireworks-ai", "anthropic"}
 # providerID IS the card; a `codex` providerID, if one ever appears, belongs on
 # the same card, because both names describe one ChatGPT subscription.
 #
-# Go and Zen are deliberately NOT folded. They are one product with two billing
-# relationships — a subscription with rolling windows, and a credit balance —
-# and one card cannot be two things. separate cards keep the rule simple: a card
-# is one account you owe, and it shows whatever that account can report.
-CARD_FOLDS = {"codex": "openai"}
+# OpenCode Go and OpenCode Zen are two billing surfaces of the same account:
+# Go exposes rolling subscription limits while Zen exposes the prepaid credit
+# balance. Fold both provider IDs into one OpenCode Go card so the panel has one
+# entry with both kinds of information.
+CARD_FOLDS = {"codex": "openai", "opencode": "opencode-go", "openai-api": "openai"}
 
 # Local endpoints and free tiers: nothing to subscribe to, nothing to track.
 # Replicate is NOT here: it is a paid account with no usage API, and the panel
@@ -272,7 +277,7 @@ def card_map() -> tuple[dict[str, dict[str, Any]], set[str]]:
 
     {
       "providers": {
-        "replicate": { "name": "Replicate", "tierLabel": "Prepaid" },
+        "replicate": { "name": "Replicate", "tierLabel": "Pro" },
         "openrouter": { "enabled": false }
       }
     }
@@ -295,7 +300,7 @@ def card_map() -> tuple[dict[str, dict[str, Any]], set[str]]:
       provider_id = str(provider_id)
       entry = raw_entry if isinstance(raw_entry, dict) else {}
       overridden.add(provider_id)
-      base = dict(cards.get(provider_id) or {"id": provider_id, "name": provider_id, "tierLabel": "Subscription"})
+      base = dict(cards.get(provider_id) or {"id": provider_id, "name": provider_id})
       base.update({key: value for key, value in entry.items() if key in ("id", "name", "tierLabel")})
       cards[provider_id] = base
       if entry.get("enabled") is False:
@@ -521,11 +526,12 @@ def fetch_openrouter() -> tuple[dict[str, Any], str]:
 
 
 def fetch_opencode_go_limits() -> tuple[dict[str, Any], str]:
-  """The Go subscription's rolling windows, as percentages of its allowance.
+  """The Go subscription's rolling windows, and the Zen wallet behind them.
 
-  opencode exposes this endpoint for Go only. Zen is a pay-per-token balance
-  with no API at all — opencode's own feature request (#10448) is still open —
-  so Zen can report what it has spent but not what is left.
+  opencode exposes the rolling windows for Go only, as percentages of the
+  allowance. The Zen balance has no API-key surface at all: it lives behind the
+  console's own signed-in session, so it is read here when that session is
+  configured and left to the funded estimate when it is not.
   """
   key = read_key("opencode-go", "OPENCODE_GO_API_KEY", "opencode-go")
   if not key:
@@ -553,7 +559,72 @@ def fetch_opencode_go_limits() -> tuple[dict[str, Any], str]:
     })
   if not limits:
     return {}, "OpenCode Go returned no usage windows"
-  return {"limits": limits}, ""
+
+  overrides: dict[str, Any] = {"limits": limits}
+  balance, note = fetch_zen_balance()
+  if balance is not None:
+    overrides["balance"] = balance
+  elif note:
+    overrides["balanceStatusText"] = note
+  return overrides, ""
+
+
+def zen_console() -> tuple[str, str]:
+  """The console session cookie and workspace id, from this card's config.
+
+  /console/api/billing/status answers a signed-in browser session plus an
+  x-org-id header and nothing else: an API key gets 403, and the response is
+  what the console's own balance line is drawn from. Both values are pasted
+  from a signed-in browser into ~/.config/omarchy/agents/opencode-go.json as
+  "sessionCookie" and "orgId".
+  """
+  config = read_json(config_home() / "omarchy" / "agents" / "opencode-go.json")
+  return (
+    str(config.get("sessionCookie") or "").strip(),
+    str(config.get("orgId") or "").strip(),
+  )
+
+
+def fetch_zen_balance() -> tuple[dict[str, Any] | None, str]:
+  """The Zen wallet as the console reports it, and why not when it cannot.
+
+  The reason is empty when no session is configured at all: a card that never
+  promised a live balance has nothing to apologise for.
+  """
+  cookie, org = zen_console()
+  if not cookie or not org:
+    return None, ""
+
+  try:
+    payload = get_json_with_headers(ZEN_BILLING_URL, {
+      "Accept": "application/json",
+      "Cookie": cookie,
+      "User-Agent": USER_AGENT,
+      "x-org-id": org,
+    })
+  except OpencodeError as error:
+    # An expired session must never cost the Go card its rolling windows.
+    return None, f"Zen balance unreadable ({error}); refresh sessionCookie"
+
+  # "Micro" here is 1e-6 cents, so a dollar is 1e8 of them.
+  raw = payload.get("availableMicroCents")
+  if raw is None:
+    raw = payload.get("balanceMicroCents")
+  try:
+    remaining = float(raw) / 100_000_000
+  except (TypeError, ValueError):
+    return None, "Zen balance unreadable; the console returned no amount"
+  if not math.isfinite(remaining):
+    return None, "Zen balance unreadable; the console returned no amount"
+  return {
+    "remaining": round(remaining, 2),
+    # The console reports what is left, never what was funded; without a total
+    # there is no ratio to draw.
+    "funded": 0.0,
+    "spent": 0.0,
+    "currency": str(payload.get("currency") or "USD").upper(),
+    "estimated": False,
+  }, ""
 
 
 def openai_admin_key() -> str:
@@ -636,10 +707,11 @@ def fetch_openai_api_spend() -> tuple[dict[str, Any], str]:
     "funded": funded,
     "spent": round(total, 2),
     "currency": "USD",
-    # Derived from a figure you supplied, measured against spend — the same
-    # shape as Fireworks, and marked the same way so the card keeps its Balance
-    # field.
-    "estimated": True,
+    # The spend is measured, not guessed, and the funded figure is the amount
+    # actually added to the account, so what is left is a real reading rather
+    # than a rounding: it carries no "~". A top-up is the one thing that still
+    # has to be told to us, through the openai-api config entry.
+    "estimated": False,
   }}, ""
 
 
@@ -678,6 +750,33 @@ def openai_costs_total(key: str, start: datetime) -> float:
   return total
 
 
+def remote_backoff_file(url: str) -> Path:
+  base = str(url).split("?", 1)[0]
+  root = cache_home() / "omarchy" / "agent-usage-backoff"
+  root.mkdir(parents=True, exist_ok=True)
+  return root / (hashlib.sha1(base.encode("utf-8")).hexdigest()[:16] + ".retry")
+
+
+def remote_backoff_remaining(url: str) -> int:
+  path = remote_backoff_file(url)
+  try:
+    remaining = int(float(path.read_text(encoding="utf-8").strip()) - time.time())
+  except (OSError, ValueError):
+    return 0
+  if remaining <= 0:
+    path.unlink(missing_ok=True)
+    return 0
+  return remaining
+
+
+def set_remote_backoff(url: str, seconds: int = 300) -> None:
+  path = remote_backoff_file(url)
+  try:
+    path.write_text(str(time.time() + seconds), encoding="utf-8")
+  except OSError:
+    pass
+
+
 def get_json(url: str, key: str, account_id: str = "") -> dict[str, Any]:
   # opencode asks clients to identify themselves, and Cloudflare in front of
   # opencode.ai answers a bare Python-urllib user agent with 403 before the key
@@ -690,11 +789,25 @@ def get_json(url: str, key: str, account_id: str = "") -> dict[str, Any]:
   # The ChatGPT backend wants to know which account the token speaks for.
   if account_id:
     headers["chatgpt-account-id"] = account_id
+  return get_json_with_headers(url, headers)
+
+
+def get_json_with_headers(url: str, headers: dict[str, str]) -> dict[str, Any]:
+  """A GET whose authentication is already decided by the caller."""
+  retry = remote_backoff_remaining(url)
+  if retry > 0:
+    minutes = max(1, math.ceil(retry / 60))
+    raise OpencodeError(f"rate limited; retry in {minutes}m")
+
   request = urllib.request.Request(url, headers=headers)
   try:
     with urllib.request.urlopen(request, timeout=15) as response:
       payload = json.load(response)
+    remote_backoff_file(url).unlink(missing_ok=True)
   except urllib.error.HTTPError as error:
+    if error.code == 429:
+      set_remote_backoff(url)
+      raise OpencodeError("rate limited; retry in 5m") from error
     if error.code == 401:
       raise OpencodeError("the API key was rejected") from error
     if error.code == 403:
@@ -849,7 +962,9 @@ def fetch_openai_limits() -> tuple[dict[str, Any], str]:
         "remaining": remaining,
         "funded": 0.0,
         "spent": 0.0,
-        "currency": "USD",
+        # ChatGPT/Codex calls this field "credits", but it is not a USD
+        # balance and must not be rendered with a dollar sign.
+        "currency": "credits",
         "estimated": False,
       }
   return overrides, ""
@@ -860,9 +975,10 @@ def fetch_openai_limits() -> tuple[dict[str, Any], str]:
 # session through opencode for it.
 # Cards whose remaining balance is estimated from opencode's own records rather
 # than read from a provider API: you supply the balance you can see, opencode
-# supplies the spend. Replicate is deliberately absent — its API carries no cost
-# field at all, so there would be nothing to subtract.
-LOCAL_ESTIMATE_CARDS = ("opencode",)
+# supplies the spend. Empty today — Zen, the only card that ever used it, now
+# reads its balance from the console — and kept because a provider without a
+# balance endpoint is the normal case, not an exception.
+LOCAL_ESTIMATE_CARDS: tuple[str, ...] = ()
 
 # A provider's worth can be a credit ledger or a set of rolling windows; either
 # one earns a card even with no local session history.
@@ -1078,7 +1194,7 @@ def build_records(stats: dict[str, Any], dates: list[str], only: list[str], excl
     records[card_id] = record_from_stats(
       card_id,
       str(description.get("name") or card_id),
-      str(description.get("tierLabel") or "Subscription"),
+      str(description.get("tierLabel") or ""),
       entries[0] if len(entries) == 1 else merge_stats(entries, dates),
       dates,
     )
@@ -1088,33 +1204,53 @@ def build_records(stats: dict[str, Any], dates: list[str], only: list[str], excl
   # never run a session for that provider. A provider with neither usage nor a
   # readable remote figure is left out entirely rather than shown as an empty
   # row.
-  for card_id, fetch in REMOTE_FETCHERS.items():
+  for provider_id, fetch in REMOTE_FETCHERS.items():
+    card_id = str(cards.get(provider_id, {}).get("id") or provider_id)
     if card_id in disabled or not wanted(card_id, only, excluded):
       continue
     try:
       overrides, status = fetch()
     except OpencodeError as error:
-      overrides, status = {}, f"{_remote_name(cards, card_id)}: {error}"
+      overrides, status = {}, f"{_remote_name(cards, provider_id)}: {error}"
     if not overrides and card_id not in records:
       continue
     if card_id not in records:
-      description = cards.get(card_id, {})
+      description = cards.get(provider_id, {})
       records[card_id] = record_from_stats(
         card_id,
         str(description.get("name") or card_id),
-        str(description.get("tierLabel") or "Prepaid"),
+        str(description.get("tierLabel") or ""),
         blank_stats(dates),
         dates,
       )
+    # OpenAI API billing is a separate meter on the combined OpenAI card.
+    # Preserve it as a second balance instead of overwriting ChatGPT credits.
+    if provider_id == "openai-api":
+      # API billing is optional; it must not hide a working ChatGPT
+      # subscription when the organization key is unavailable.
+      if "balance" in overrides:
+        records[card_id]["apiBalance"] = overrides.pop("balance")
+      if "usageStatusText" in overrides:
+        records[card_id]["apiStatusText"] = overrides.pop("usageStatusText")
+      if "authHelpText" in overrides:
+        records[card_id]["apiAuthHelpText"] = overrides.pop("authHelpText")
     records[card_id].update(overrides)
     if not overrides and status:
-      records[card_id]["usageStatusText"] = "Unavailable"
-      records[card_id]["authHelpText"] = status
+      if provider_id == "openai-api":
+        records[card_id]["apiStatusText"] = status
+      else:
+        records[card_id]["usageStatusText"] = "Unavailable"
+        records[card_id]["authHelpText"] = status
 
   # A prepaid provider whose ledger we cannot read still gets a figure: you
-  # supply the balance, opencode's own records supply the spend.
+  # supply the balance, opencode's own records supply the spend. A card that did
+  # read its real ledger keeps it — a typed-in estimate never overwrites a live
+  # balance.
   for card_id in LOCAL_ESTIMATE_CARDS:
     if card_id in disabled or not wanted(card_id, only, excluded):
+      continue
+    live = records.get(card_id, {}).get("balance")
+    if isinstance(live, dict) and live.get("estimated") is False:
       continue
     entries = [stats[pid] for pid in stats if cards.get(pid, {}).get("id") == card_id]
     merged = entries[0] if len(entries) == 1 else merge_stats(entries, dates)
@@ -1126,7 +1262,7 @@ def build_records(stats: dict[str, Any], dates: list[str], only: list[str], excl
       records[card_id] = record_from_stats(
         card_id,
         str(description.get("name") or card_id),
-        str(description.get("tierLabel") or "Prepaid"),
+        str(description.get("tierLabel") or ""),
         merged,
         dates,
       )
@@ -1146,7 +1282,7 @@ def build_records(stats: dict[str, Any], dates: list[str], only: list[str], excl
     records[card_id] = record_from_stats(
       card_id,
       str(description.get("name") or card_id),
-      str(description.get("tierLabel") or "Subscription"),
+      str(description.get("tierLabel") or ""),
       blank_stats(dates),
       dates,
     )
@@ -1208,6 +1344,34 @@ def set_funded(provider_id: str, raw_amount: str) -> int:
   return 0
 
 
+def set_api_key(provider_id: str, raw_key: str) -> int:
+  """Store a provider API key without putting it in process arguments."""
+  if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", provider_id):
+    print(f"omarchy-agent-usage-opencode: refusing suspicious provider id {provider_id!r}", file=sys.stderr)
+    return 2
+
+  key = str(raw_key or "").strip()
+  if not key:
+    print("omarchy-agent-usage-opencode: refusing an empty API key", file=sys.stderr)
+    return 2
+
+  path = config_home() / "omarchy" / "agents" / f"{provider_id}.json"
+  config = read_json(path)
+  config["apiKey"] = key
+
+  try:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, config)
+    path.chmod(0o600)
+  except OSError as error:
+    print(f"omarchy-agent-usage-opencode: could not write {path} ({error})", file=sys.stderr)
+    return 2
+
+  # Never echo the credential, even in success output.
+  print(json.dumps({"provider": provider_id, "saved": True}))
+  return 0
+
+
 def set_order(raw_ids: str) -> int:
   """Record the order the cards should be drawn in.
 
@@ -1255,6 +1419,12 @@ def estimate_balance(card_id: str, stats: dict[str, Any]) -> dict[str, Any] | No
   keeps the number from double-subtracting a top-up.
   """
   config = read_json(config_home() / "omarchy" / "agents" / f"{card_id}.json")
+  # Zen's existing funded amount predates the Go/Zen card fold. Keep reading
+  # that config as a migration fallback; new edits are saved under the card ID.
+  if card_id == "opencode-go" and "fundedAmount" not in config:
+    legacy = read_json(config_home() / "omarchy" / "agents" / "opencode.json")
+    if "fundedAmount" in legacy:
+      config = legacy
   raw = config.get("fundedAmount")
   # An absent figure means nobody has told us the balance. Zero or below is a
   # real reading — an overdrawn prepaid account is exactly the case worth
@@ -1337,6 +1507,8 @@ def main() -> int:
   parser.add_argument("--except", action="append", default=[], dest="excluded")
   parser.add_argument("--set-funded", nargs=2, metavar=("PROVIDER", "AMOUNT"), default=None,
                       help="Record how much has been funded for an estimated balance, then exit")
+  parser.add_argument("--set-api-key", default=None, metavar="PROVIDER",
+                      help="Read a provider API key from stdin and save it, then exit")
   parser.add_argument("--set-order", default=None, metavar="ID,ID,...",
                       help="Record the order the cards are drawn in, then exit")
   parser.add_argument("--set-hidden", default=None, metavar="ID,ID,...",
@@ -1347,6 +1519,8 @@ def main() -> int:
   # Writing one config is not a refresh: leave before the database is touched.
   if args.set_funded:
     return set_funded(str(args.set_funded[0]), str(args.set_funded[1]))
+  if args.set_api_key is not None:
+    return set_api_key(str(args.set_api_key), sys.stdin.read())
   if args.set_order is not None:
     return set_order(str(args.set_order))
   if args.set_hidden is not None:

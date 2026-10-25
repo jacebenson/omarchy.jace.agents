@@ -344,6 +344,8 @@ Item {
       providerName: String(record.name || record.id),
       ready: record.ready === true || synced,
       usageStatusText: String(record.usageStatusText || ""),
+      stale: record.stale === true,
+      staleReason: String(record.staleReason || ""),
       authHelpText: String(record.authHelpText || ""),
 
       // Rate limits and balances stay per-account and are never merged
@@ -354,6 +356,10 @@ Item {
       resets: record.resets && typeof record.resets === "object" ? record.resets : null,
       tierLabel: String(record.tierLabel || ""),
       balance: balanceValue(record.balance),
+      apiBalance: balanceValue(record.apiBalance),
+      // Why a balance that should be readable was not, when the collector can
+      // say. It never displaces the card's own status line.
+      balanceStatusText: String(record.balanceStatusText || ""),
 
       todayPrompts: synced ? numberValue(stats.todayPrompts) : numberValue(record.todayPrompts),
       todaySessions: synced ? numberValue(stats.todaySessions) : numberValue(record.todaySessions),

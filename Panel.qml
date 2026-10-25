@@ -12,7 +12,7 @@ import qs.Ui
 Panel {
   id: root
   moduleName: "omarchy.agents"
-  ipcTarget: "omarchy.agents"
+  ipcTarget: "jace.agents"
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -59,7 +59,7 @@ Panel {
     var urls = {
       "openai": "https://chatgpt.com/?openaicom_referred=true#settings/Usage",
       "openai-api": "https://platform.openai.com/settings/organization/billing/overview",
-      "opencode-go": "https://opencode.ai/auth",
+      "opencode-go": "https://opencode.ai/console",
       "opencode": "https://opencode.ai/auth",
       "deepseek": "https://platform.deepseek.com/usage",
       "openrouter": "https://openrouter.ai/settings/credits",
@@ -76,8 +76,11 @@ Panel {
   // number, and this way there is no second place to look.
   function openBilling(p) {
     if (!p) return
-    var url = billingUrl(p.providerId)
-    if (url === "") return
+    openUrl(billingUrl(p.providerId))
+  }
+
+  function openUrl(url) {
+    if (String(url || "") === "") return
     Quickshell.execDetached(["omarchy-launch-browser", url])
     root.close()
   }
@@ -93,8 +96,18 @@ Panel {
 
   property string fundedError: ""
   property string orderError: ""
+  property string apiKeyError: ""
+  property string pendingApiKey: ""
 
   readonly property string collectorPath: localPath(Qt.resolvedUrl("bin/omarchy-agent-usage-opencode"))
+  readonly property var apiKeyProviderIds: ["deepseek", "openrouter", "opencode-go", "openai-api"]
+
+  function providerConfigPath(providerId) {
+    var configProviders = ["deepseek", "openrouter", "opencode-go", "openai-api", "opencode", "fireworks"]
+    if (configProviders.indexOf(String(providerId || "")) === -1) return ""
+    var configHome = Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config"
+    return configHome + "/omarchy/agents/" + String(providerId) + ".json"
+  }
 
   function localPath(url) {
     var text = String(url || "")
@@ -104,10 +117,10 @@ Panel {
 
   // Cards whose remaining balance is worked out rather than read: you supply the
   // figure you can see, and the spend comes from a provider API (Fireworks, the
-  // OpenAI API platform) or from opencode's own records (Zen). It belongs on
-  // exactly those cards — a provider that can read its real ledger already has
-  // the answer, and one whose collector never reads this file would be a field
-  // that does nothing.
+  // OpenAI API platform), or from a balance opencode records but cannot price.
+  // It belongs on exactly those cards — Zen used to be here and is not any
+  // more, because the OpenCode console reports that balance itself, so a typed
+  // number would be a second opinion rather than the answer.
   readonly property var estimatedBalanceProviders: ["fireworks", "opencode", "openai-api"]
 
   function needsFundedAmount(p) {
@@ -128,6 +141,21 @@ Panel {
     fundedError = ""
     setFundedProcess.command = [root.collectorPath, "--set-funded", providerId, amount]
     setFundedProcess.running = true
+  }
+
+  function saveApiKey(providerId, key) {
+    if (providerId === "" || root.collectorPath === "" || String(key || "") === "") return
+    apiKeyError = ""
+    pendingApiKey = String(key)
+    setApiKeyProcess.command = [root.collectorPath, "--set-api-key", providerId]
+    setApiKeyProcess.running = true
+  }
+
+  function editProviderFile(providerId) {
+    var path = root.providerConfigPath(providerId)
+    if (path === "") return
+    Quickshell.execDetached(["omarchy-launch-editor", path])
+    root.close()
   }
 
   // Every id this plugin already knows about, rendered or not. A card whose
@@ -237,6 +265,24 @@ Panel {
     onExited: function(code) {
       if (code !== 0) {
         root.fundedError = "Save failed"
+        return
+      }
+      root.refreshNow()
+    }
+  }
+
+  Process {
+    id: setApiKeyProcess
+    running: false
+    stdinEnabled: true
+    onStarted: {
+      write(root.pendingApiKey + "\n")
+      root.pendingApiKey = ""
+    }
+    onExited: function(code) {
+      root.pendingApiKey = ""
+      if (code !== 0) {
+        root.apiKeyError = "Could not save API key"
         return
       }
       root.refreshNow()
@@ -395,37 +441,43 @@ Panel {
   function formatMoney(value, currency) {
     var amount = Number(value)
     if (!isFinite(amount)) amount = 0
+    var code = String(currency || "USD").toUpperCase()
+    if (code === "CREDITS") {
+      var whole = Math.round(Math.abs(amount)).toString()
+      whole = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",")
+      return (amount < 0 ? "-" : "") + whole + " credits"
+    }
     // A negative ledger reads "-$0.01" rather than "$-0.01".
     return (amount < 0 ? "-" : "") + currencyPrefix(currency) + Math.abs(amount).toFixed(2)
   }
 
   // An estimate wears its caveat on the figure: "~" is the universal "about",
   // and it survives an elided line where a trailing word does not.
+  function balanceLabel(providerId, api) {
+    if (api) return "API Balance"
+    var id = String(providerId || "")
+    if (id === "opencode-go") return "Zen Balance"
+    if (id === "openai") return "Credits"
+    return "Balance"
+  }
+
   function balanceText(b) {
     if (!b) return ""
     return (b.estimated ? "~" : "") + formatMoney(b.remaining, b.currency)
   }
 
-  // The line under the name: what this subscription is, and for a prepaid
-  // account what it has cost so far. An auth or endpoint problem takes the
-  // line over, because that is the more useful thing to know.
+  // The line under the name is the plan level, and only a plan level: "Plus",
+  // "Go", "Pro". How an account is billed ("Prepaid", "Subscription") is what
+  // the panel groups rows by, so repeating it under the name says nothing.
   function subText(p) {
     if (!p) return ""
     if (String(p.usageStatusText || "") !== "") return p.usageStatusText
 
     var tier = String(p.tierLabel || "")
-    if (tier === "") tier = "Subscription"
-    tier = tier.charAt(0).toUpperCase() + tier.slice(1)
-
-    var b = p.balance
-    if (!b) return tier
-    // A window and a credit at once: the windows own the trailing space, so the
-    // credit is stated here instead of being dropped.
-    if (p.limits && p.limits.length > 0) return tier + " · " + balanceText(b) + " credit"
-    // A funded figure is what says "prepaid", so the word is dropped and the
-    // money keeps its room: an elided "of $90…" reads as $90 or $900.
-    if (b.funded > 0)
-      return formatMoney(b.spent, b.currency) + " spent of " + formatMoney(b.funded, b.currency)
+    var generic = ["prepaid", "subscription"]
+    if (generic.indexOf(tier.toLowerCase()) !== -1) tier = ""
+    if (tier !== "") tier = tier.charAt(0).toUpperCase() + tier.slice(1)
+    if (p.stale) tier = tier === "" ? "Stale" : tier + " · stale"
     return tier
   }
 
@@ -642,9 +694,14 @@ Panel {
     property var provider: null
 
     readonly property string url: root.billingUrl(provider ? provider.providerId : "")
+    readonly property string apiUrl: provider && provider.providerId === "openai"
+      ? root.billingUrl("openai-api") : ""
     readonly property string name: provider ? String(provider.providerName || provider.providerId) : ""
     readonly property bool funded: root.needsFundedAmount(provider)
+    readonly property bool apiKey: provider && root.apiKeyProviderIds.indexOf(provider.providerId) !== -1
+    readonly property string configPath: root.providerConfigPath(provider ? provider.providerId : "")
     readonly property var resets: provider && provider.resets ? provider.resets : null
+    readonly property string balanceStatusText: provider ? String(provider.balanceStatusText || "") : ""
 
     // Fill from whatever is already recorded each time the card opens, and
     // leave it alone while it is open so a refresh cannot wipe out typing.
@@ -660,6 +717,11 @@ Panel {
       // A negative reading is valid: an overdrawn prepaid account is a thing.
       if (!isFinite(amount)) return
       root.saveFundedAmount(provider ? provider.providerId : "", amount.toFixed(2))
+    }
+
+    function commitApiKey(text) {
+      var value = String(text || "").trim()
+      if (value !== "") root.saveApiKey(provider ? provider.providerId : "", value)
     }
 
     width: parent ? parent.width : implicitWidth
@@ -689,7 +751,9 @@ Panel {
         anchors.leftMargin: Style.space(10)
         anchors.rightMargin: Style.space(10)
         anchors.verticalCenter: parent.verticalCenter
-        text: "Open " + providerDetails.name + "'s billing page"
+        text: providerDetails.provider && providerDetails.provider.providerId === "openai"
+          ? "Open ChatGPT / Codex usage"
+          : "Open " + providerDetails.name + "'s billing page"
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -702,6 +766,45 @@ Panel {
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
         onClicked: root.openBilling(providerDetails.provider)
+      }
+    }
+
+    // OpenAI uses two separate account surfaces: keep the API billing link
+    // beside the ChatGPT/Codex usage link rather than merging their URLs.
+    Item {
+      visible: providerDetails.apiUrl !== ""
+      width: parent.width
+      implicitHeight: apiLinkLabel.implicitHeight + Style.space(12)
+
+      Rectangle {
+        anchors.fill: parent
+        radius: Style.cornerRadius
+        color: root.alpha(root.foreground, apiLinkHover.containsMouse ? 0.10 : 0.05)
+
+        Behavior on color { ColorAnimation { duration: 120 } }
+      }
+
+      Text {
+        id: apiLinkLabel
+        textFormat: Text.PlainText
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: Style.space(10)
+        anchors.rightMargin: Style.space(10)
+        anchors.verticalCenter: parent.verticalCenter
+        text: "Open OpenAI API billing"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+
+      MouseArea {
+        id: apiLinkHover
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.openUrl(providerDetails.apiUrl)
       }
     }
 
@@ -721,6 +824,20 @@ Panel {
         return text
       }
       color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
+
+    // A balance the card could not read this time. It sits in the details
+    // rather than under the name, because a stale console session is a note
+    // about one figure, not a broken subscription.
+    Text {
+      textFormat: Text.PlainText
+      visible: String(providerDetails.balanceStatusText || "") !== ""
+      width: parent.width
+      text: providerDetails.balanceStatusText
+      color: root.urgent
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
       elide: Text.ElideRight
@@ -783,6 +900,74 @@ Panel {
         verticalPadding: Style.space(4)
         onClicked: providerDetails.commitFunded(fundedField.text)
       }
+    }
+
+    Item {
+      visible: providerDetails.apiKey
+      width: parent.width
+      implicitHeight: Math.max(apiKeyLabel.implicitHeight, apiKeyField.implicitHeight) + Style.space(8)
+
+      Text {
+        id: apiKeyLabel
+        textFormat: Text.PlainText
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.apiKeyError !== "" ? root.apiKeyError : "Go API key"
+        color: root.apiKeyError !== "" ? root.urgent : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        width: Style.space(84)
+        elide: Text.ElideRight
+      }
+
+      TextField {
+        id: apiKeyField
+        anchors.left: apiKeyLabel.right
+        anchors.leftMargin: Style.space(6)
+        anchors.right: apiKeySave.left
+        anchors.rightMargin: Style.space(6)
+        anchors.verticalCenter: parent.verticalCenter
+        placeholderText: "paste a replacement key"
+        echoMode: TextInput.Password
+        foreground: root.foreground
+        font.family: root.fontFamily
+        verticalPadding: Style.space(4)
+        onAccepted: providerDetails.commitApiKey(text)
+      }
+
+      Button {
+        id: apiKeySave
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: "Save"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        fontSize: Style.font.bodySmall
+        verticalPadding: Style.space(4)
+        onClicked: providerDetails.commitApiKey(apiKeyField.text)
+      }
+    }
+
+    Text {
+      textFormat: Text.PlainText
+      visible: providerDetails.apiKey
+      width: parent.width
+      text: "Saved to ~/.config/omarchy/agents/opencode-go.json; key hidden; OPENCODE_GO_API_KEY overrides it"
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
+
+    Button {
+      visible: providerDetails.apiKey
+      width: parent.width
+      text: "Edit key file"
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      fontSize: Style.font.bodySmall
+      verticalPadding: Style.space(4)
+      onClicked: root.editApiKeyFile()
     }
 
     // Reordering, inside the group. Two buttons rather than a drag: dragging is
@@ -943,6 +1128,7 @@ Panel {
 
     readonly property var limits: root.limitWindows(provider)
     readonly property var balance: provider ? (provider.balance || null) : null
+    readonly property var apiBalance: provider ? (provider.apiBalance || null) : null
     readonly property bool hasStatus: String(provider ? provider.usageStatusText : "") !== ""
     readonly property bool balanceAlarming: !!balance && balance.funded > 0
       && balance.remaining / balance.funded <= 0.1
@@ -955,10 +1141,6 @@ Panel {
       return best
     }
 
-    readonly property real balanceRatio: balance && balance.funded > 0
-      ? root.clamp(balance.remaining / balance.funded, 0, 1)
-      : -1
-
     // The active block on the right. A row only exists when it has a figure, so
     // this is either the balance or the window list; a status line takes the
     // name column instead and leaves this empty.
@@ -968,7 +1150,7 @@ Panel {
     // name, where it still reads as a second, smaller fact.
     readonly property var trailingBlock: hasStatus
       ? null
-      : (limits.length > 0 ? windowColumn : balanceBlock)
+      : metricColumn
 
     width: parent ? parent.width : implicitWidth
     implicitHeight: summary.implicitHeight + (details.visible ? details.height + Style.spacing.md : 0)
@@ -1026,6 +1208,9 @@ Panel {
           id: subLine
           textFormat: Text.PlainText
           width: parent.width
+          // Nothing to say means nothing on screen: a plan-less account gives
+          // the name the whole left column instead of a stray empty line.
+          visible: text !== ""
           text: root.subText(providerRow.provider)
           color: providerRow.hasStatus ? root.urgent : root.dim
           font.family: root.fontFamily
@@ -1044,51 +1229,96 @@ Panel {
         height: providerRow.trailingBlock ? providerRow.trailingBlock.height : 0
 
         Column {
-          id: balanceBlock
-          visible: !providerRow.hasStatus && !!providerRow.balance
+          id: metricColumn
+          visible: !providerRow.hasStatus && (!!providerRow.balance || !!providerRow.apiBalance || providerRow.limits.length > 0)
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
-          spacing: Style.space(6)
+          width: Style.space(150)
+          spacing: Style.space(3)
 
-          Text {
-            id: balanceValue
-            textFormat: Text.PlainText
-            anchors.right: parent.right
-            text: root.balanceText(providerRow.balance)
-            color: providerRow.balanceAlarming ? root.urgent : root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.title
-            font.bold: true
+          Column {
+            id: windowColumn
+            visible: providerRow.limits.length > 0
+            spacing: Style.space(2)
+
+            Repeater {
+              model: providerRow.limits
+
+              LimitLine {
+                required property var modelData
+                window: modelData
+                primary: modelData.percent >= providerRow.bindingPercent
+              }
+            }
           }
 
-          Meter {
-            id: balanceMeter
-            visible: providerRow.balanceRatio >= 0
-            width: Style.space(96)
-            // Collapse the rail when there is no funded figure to draw it
-            // against, so an unknown total costs no vertical space.
-            thickness: providerRow.balanceRatio >= 0
-              ? Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
-              : 0
-            value: providerRow.balanceRatio
-            alarming: providerRow.balanceAlarming
+          Column {
+            id: balanceBlock
+            visible: !!providerRow.balance
+            spacing: Style.space(2)
+
+            Item {
+              id: balanceRow
+              width: metricColumn.width
+              height: Math.max(balanceLabelText.implicitHeight, balanceValue.implicitHeight)
+
+              Text {
+                id: balanceLabelText
+                textFormat: Text.PlainText
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.balanceLabel(providerRow.provider ? providerRow.provider.providerId : "", false)
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                id: balanceValue
+                textFormat: Text.PlainText
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.balanceText(providerRow.balance)
+                color: providerRow.balanceAlarming ? root.urgent : root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                horizontalAlignment: Text.AlignRight
+              }
+            }
           }
-        }
 
-        Column {
-          id: windowColumn
-          visible: !providerRow.hasStatus && !providerRow.balance && providerRow.limits.length > 0
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          spacing: Style.space(4)
+          Column {
+            id: apiBalanceBlock
+            visible: !!providerRow.apiBalance
+            spacing: Style.space(2)
 
-          Repeater {
-            model: providerRow.limits
+            Item {
+              id: apiBalanceRow
+              width: metricColumn.width
+              height: Math.max(apiBalanceLabelText.implicitHeight, apiBalanceValue.implicitHeight)
 
-            LimitLine {
-              required property var modelData
-              window: modelData
-              primary: modelData.percent >= providerRow.bindingPercent
+              Text {
+                id: apiBalanceLabelText
+                textFormat: Text.PlainText
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.balanceLabel("", true)
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                id: apiBalanceValue
+                textFormat: Text.PlainText
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.balanceText(providerRow.apiBalance)
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                horizontalAlignment: Text.AlignRight
+              }
             }
           }
         }

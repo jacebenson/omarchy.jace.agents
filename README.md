@@ -36,8 +36,10 @@ clone.
   decides the sequence within a group. A provider that appears after the last
   reorder keeps its alphabetical place at the end of its group until the next
   move rewrites the list.
-- **Prepaid accounts** show what is left and what has been spent, with a meter
-  that drains toward empty.
+- **Prepaid accounts** show one line: what is left, as `Balance  $5.78`. An API
+  key is billed against a wallet, not an allowance, so there is no funded total
+  to draw a meter against and no "spent of" to state; the figure turns red at
+  the last 10% and that is the whole warning.
 - **Subscriptions** show one line per rolling window (`5h`, `7d`, `30d`): a bar,
   and the time until it resets. The bar *is* the percentage, so the number is
   not repeated beside it — label, bar, and countdown all line up across windows,
@@ -60,8 +62,9 @@ current rows are OpenAI, OpenCode Go, DeepSeek, Fireworks and OpenRouter, with
 Claude, Replicate and OpenCode Zen as buttons.
 
 `j`/`k` or arrows scroll, `r` or Enter refreshes, Tab moves to the neighboring
-bar panel, Esc closes. IPC: `omarchy-shell omarchy.agents
-<open|close|toggle|refresh|next>`.
+bar panel, Esc closes. IPC: `omarchy-shell jace.agents
+  <open|close|toggle|refresh|next>` (the clone registers its own target, because
+  `omarchy.agents` belongs to the stock plugin this one is cloned from).
 
 ## Data
 
@@ -91,8 +94,8 @@ there from the first frame and their numbers fill in.
 | OpenAI | 5h + 7d, from the ChatGPT backend | — | opencode (`openai`, `codex` folded in) |
 | DeepSeek | — | live, `api.deepseek.com/user/balance` | opencode |
 | OpenCode Go | 5h + 7d + 30d, from `opencode.ai/zen/go/v1/usage` | — | opencode (`opencode-go`) |
-| OpenCode Zen | — | estimated from opencode's own records | opencode (`opencode`) |
-| OpenAI API | — | estimated: your balance against `organization/costs` *(admin key)* | — |
+| OpenCode Zen | — | live, `opencode.ai/console/api/billing/status` (console session) | opencode (`opencode`) |
+| OpenAI API | — | balance against `organization/costs`, no estimate marker *(admin key)* | — |
 | OpenRouter | — | live, `openrouter.ai/api/v1/credits` | opencode |
 | Fireworks | — | estimated (upstream; needs `fundedAmount`) | opencode |
 | Claude Code | 5h + 7d, from Anthropic's OAuth endpoint | — | upstream |
@@ -180,14 +183,16 @@ never want it, the scan is the expensive part of this collector and could go.
 
 ### Known limits
 
-- **No dashboard here is readable by a key.** OpenCode Zen's balance (a Stripe
-  customer credit rendered into the console page), Fireworks' credits and
-  Replicate's balance all sit behind session-cookie endpoints — the keys this
-  plugin holds are deliberately narrower. Zen and Fireworks therefore *estimate*
-  (you supply the balance you can see; the spend comes from opencode's records
-  or Fireworks' billing API), Replicate stays a plain link, and none of it is a
-  live ledger. `zen/v1/balance` and `zen/v1/usage` are 404; an open feature
-  request tracks the former.
+- **No dashboard here is readable by a key.** Fireworks' credits and Replicate's
+  balance sit behind session-cookie endpoints — the keys this plugin holds are
+  deliberately narrower. Fireworks therefore *estimates* (you supply the balance
+  you can see; the spend comes from its billing API) and Replicate stays a plain
+  link. OpenCode Zen used to be in that group; it is read live now, from the
+  console's own session (`sessionCookie` + `orgId` in
+  `~/.config/omarchy/agents/opencode-go.json`), which is a browser credential
+  and expires — when it does, the Go card keeps its windows and the expanded
+  card says the Zen balance could not be read. `zen/v1/balance` is still 404;
+  the console endpoint is the only source.
 - **GitHub Copilot's quota is not reachable here.** The usage endpoint requires
   a Copilot-entitled GitHub token, and no Copilot credential is stored by
   opencode on this machine.
