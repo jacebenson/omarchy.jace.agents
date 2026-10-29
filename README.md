@@ -38,8 +38,10 @@ clone.
   move rewrites the list.
 - **Prepaid accounts** show one line: what is left, as `Balance  $5.78`. An API
   key is billed against a wallet, not an allowance, so there is no funded total
-  to draw a meter against and no "spent of" to state; the figure turns red at
-  the last 10% and that is the whole warning.
+  to draw a meter against and no "spent of" to state; the figure is stated and
+  nothing more. An empty wallet is not an alarm — you can top one up at any
+  time — so the red the bar carries belongs to a rolling window, where being
+  nearly spent means you cannot spend around it.
 - **Subscriptions** show one line per rolling window (`5h`, `7d`, `30d`): a bar,
   and the time until it resets. The bar *is* the percentage, so the number is
   not repeated beside it — label, bar, and countdown all line up across windows,

@@ -293,8 +293,12 @@ Panel {
   // telling the truth while it sits open.
   property double nowMs: Date.now()
 
-  // The bar dot answers for the whole list: an allowance or a meter that is
-  // nearly gone lights it whichever subscription it belongs to.
+  // The bar dot answers for the whole list, and it answers for one thing: a
+  // rolling window nearly spent. Red is a subscription's alarm — an allowance
+  // you cannot buy back mid-window, where the only fix is to stop. A prepaid
+  // wallet reading $0.00 is a different fact: the fix is a top-up, you can do
+  // it any time, and a dot that stays red for days until you do is crying wolf
+  // on a machine that has not spent a cent. So only windows light it.
   readonly property bool alarming: {
     for (var i = 0; i < providers.length; i++)
       if (providerAlarming(providers[i])) return true
@@ -306,8 +310,7 @@ Panel {
     var windows = limitWindows(p)
     for (var i = 0; i < windows.length; i++)
       if (windows[i].percent >= 0.9) return true
-    var b = p.balance
-    return !!b && b.funded > 0 && b.remaining / b.funded <= 0.1
+    return false
   }
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
@@ -1130,8 +1133,6 @@ Panel {
     readonly property var balance: provider ? (provider.balance || null) : null
     readonly property var apiBalance: provider ? (provider.apiBalance || null) : null
     readonly property bool hasStatus: String(provider ? provider.usageStatusText : "") !== ""
-    readonly property bool balanceAlarming: !!balance && balance.funded > 0
-      && balance.remaining / balance.funded <= 0.1
 
     // The fullest window is the one that will stop the next prompt, so it keeps
     // full contrast while the rest recede.
@@ -1279,7 +1280,7 @@ Panel {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.balanceText(providerRow.balance)
-                color: providerRow.balanceAlarming ? root.urgent : root.foreground
+                color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 horizontalAlignment: Text.AlignRight
