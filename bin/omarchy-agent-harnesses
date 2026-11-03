@@ -1,0 +1,68 @@
+#!/bin/bash
+
+# omarchy:summary=List and launch the agent harnesses installed on this machine
+# omarchy:args=[--list] [--launch ID]
+#
+# The Agents bar widget asks this script what exists instead of hard-coding a
+# list, so a harness that is not installed never appears and one installed later
+# needs no edit. Desktop apps are focused when they are already open; a CLI gets
+# its own terminal window keyed to its command name.
+
+set -u
+
+hermes_app="$HOME/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes"
+rows=()
+
+add() { rows+=("$1|$2|$3"); }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Desktop harnesses first: they are where a subscription is spent by hand.
+[[ -x $hermes_app ]] && add hermes "Hermes Desktop" "desktop app"
+have chatgpt && add chatgpt "ChatGPT" "desktop app"
+
+# Terminal harnesses, in the order they are usually reached for.
+have codex && add codex "Codex" "terminal"
+have claude && add claude "Claude Code" "terminal"
+have opencode && add opencode "OpenCode" "terminal"
+have gemini && add gemini "Gemini CLI" "terminal"
+have grok && add grok "Grok" "terminal"
+have copilot && add copilot "GitHub Copilot" "terminal"
+have crush && add crush "Crush" "terminal"
+have pi && add pi "Pi" "terminal"
+have omp && add omp "Oh My Pi" "terminal"
+have muse && add muse "Muse Code" "terminal"
+
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+list() {
+  local first=1 row id label detail
+  printf '['
+  for row in "${rows[@]}"; do
+    IFS='|' read -r id label detail <<<"$row"
+    (( first )) || printf ','
+    first=0
+    printf '{"id":"%s","label":"%s","detail":"%s"}' \
+      "$(json_escape "$id")" "$(json_escape "$label")" "$(json_escape "$detail")"
+  done
+  printf ']'
+}
+
+launch() {
+  local id="${1:-}" row
+  for row in "${rows[@]}"; do
+    [[ ${row%%|*} == "$id" ]] || continue
+    case "$id" in
+      hermes) exec omarchy-launch-or-focus "Hermes" "uwsm-app -- $hermes_app" ;;
+      chatgpt) exec omarchy-launch-or-focus "ChatGPT" "uwsm-app -- chatgpt" ;;
+      *) exec omarchy-launch-or-focus-tui "$id" ;;
+    esac
+  done
+  echo "Unknown harness: $id" >&2
+  return 1
+}
+
+case "${1:---list}" in
+  --list) list ;;
+  --launch) shift; launch "${1:-}" ;;
+  *) echo "usage: ${0##*/} [--list] [--launch ID]" >&2; exit 2 ;;
+esac

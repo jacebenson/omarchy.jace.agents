@@ -324,9 +324,57 @@ Panel {
     usage.refreshAll(true)
   }
 
-  function launchAgent() {
-    if (root.bar) root.bar.run("omarchy-agent --pick")
+  // ---------------------------------------------------------- the harnesses
+  //
+  // Right-click answers a different question than the panel does: not "how much
+  // is left?" but "where am I going out to spend it?". The list comes from the
+  // plugin's own script, so it names only harnesses that are installed here and
+  // a new one appears without an edit to this file.
+  property bool launcherMode: false
+  property var harnesses: []
+
+  readonly property string harnessScript: localPath(Qt.resolvedUrl("bin/omarchy-agent-harnesses"))
+
+  // The launcher is the panel in a second mode, not a second surface: the panel
+  // already owns input, focus and Esc, which a nested popup inside a popup does
+  // not reliably get.
+  function openLauncher() {
+    if (harnessScript === "") return
+    launcherMode = true
+    refreshHarnesses()
+    if (!root.opened) root.open()
+    harnessColumnFlick.contentY = 0
+  }
+
+  function refreshHarnesses() {
+    if (harnessScript === "" || harnessListProcess.running) return
+    harnessListProcess.running = true
+  }
+
+  function launchHarness(id) {
+    if (harnessScript === "" || String(id || "") === "") return
     root.close()
+    Quickshell.execDetached([harnessScript, "--launch", String(id)])
+  }
+
+  Process {
+    id: harnessListProcess
+    running: false
+    command: [root.harnessScript, "--list"]
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(text)
+          root.harnesses = Array.isArray(parsed) ? parsed : []
+        } catch (error) {
+          root.harnesses = []
+        }
+      }
+    }
+
+    onExited: function(code) { if (code !== 0) root.harnesses = [] }
   }
 
   // ----------------------------------------------------------- the column
@@ -630,13 +678,17 @@ Panel {
 
   IpcHandler {
     target: root.ipcTarget
-    function open(): void { root.open() }
+    function open(): void { root.launcherMode = false; root.open() }
     function close(): void { root.close() }
-    function show(): void { root.open() }
+    function show(): void { root.launcherMode = false; root.open() }
     function hide(): void { root.close() }
-    function toggle(): void { root.toggle() }
+    function toggle(): void { if (!root.opened) root.launcherMode = false; root.toggle() }
     function refresh(): string { root.refreshNow(); return "ok" }
     function next(): string { root.scrollToNextCard(); return "ok" }
+    // Right-click has no IPC equivalent, so the launcher gets a name of its own.
+    function launcher(): string { root.openLauncher(); return "ok" }
+    // Launch one harness directly, for a keybinding or a script.
+    function run(id: string): string { root.launchHarness(id); return "ok" }
   }
 
   BarIconButton {
@@ -649,9 +701,9 @@ Panel {
     // window per subscription, in both directions, without opening the panel.
     tooltipText: root.barTooltipText()
     onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) root.launchAgent()
+      if (buttonCode === Qt.RightButton) root.openLauncher()
       else if (buttonCode === Qt.MiddleButton) root.scrollToNextCard()
-      else root.toggle()
+      else { root.launcherMode = false; root.toggle() }
     }
   }
 
@@ -663,7 +715,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(640))
+    contentHeight: panel.fittedContentHeight(root.launcherMode ? harnessColumn.implicitHeight : column.implicitHeight, Style.space(640))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -680,6 +732,7 @@ Panel {
 
       Flickable {
         id: panelFlick
+        visible: !root.launcherMode
         anchors.fill: parent
         contentWidth: width
         contentHeight: column.implicitHeight
@@ -767,6 +820,86 @@ Panel {
             font.pixelSize: Style.font.caption
             horizontalAlignment: Text.AlignHCenter
             elide: Text.ElideRight
+          }
+        }
+      }
+      // Right-click's list: the same surface and the same keys, one row per
+      // harness this machine actually has.
+      Flickable {
+        id: harnessColumnFlick
+        anchors.fill: parent
+        visible: root.launcherMode
+        contentWidth: width
+        contentHeight: harnessColumn.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+
+        Column {
+          id: harnessColumn
+          width: harnessColumnFlick.width
+          spacing: Style.space(2)
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            text: "Open a harness"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            topPadding: Style.space(2)
+            bottomPadding: Style.space(4)
+          }
+
+          Repeater {
+            model: root.harnesses
+
+            delegate: Item {
+              id: harnessRow
+              required property var modelData
+              width: parent.width
+              height: Style.spacing.controlHeight
+
+              Rectangle {
+                anchors.fill: parent
+                radius: Style.cornerRadius
+                color: harnessHover.containsMouse ? root.alpha(root.foreground, 0.09) : "transparent"
+
+                Behavior on color { ColorAnimation { duration: 120 } }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: harnessRow.modelData ? String(harnessRow.modelData.label || "") : ""
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: harnessRow.modelData ? String(harnessRow.modelData.detail || "") : ""
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                id: harnessHover
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.launchHarness(harnessRow.modelData ? harnessRow.modelData.id : "")
+              }
+            }
           }
         }
       }
