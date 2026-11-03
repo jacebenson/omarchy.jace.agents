@@ -308,8 +308,12 @@ Panel {
   function providerAlarming(p) {
     if (!p) return false
     var windows = limitWindows(p)
-    for (var i = 0; i < windows.length; i++)
+    for (var i = 0; i < windows.length; i++) {
+      // Soft windows are drawn against the low end of a published range, not a
+      // hard stop; lighting the bar for one would cry wolf.
+      if (windows[i].soft) continue
       if (windows[i].percent >= 0.9) return true
+    }
     return false
   }
 
@@ -394,12 +398,26 @@ Panel {
 
   // A collector that already knows which window a limit belongs to says so,
   // and that beats reading it back out of the label.
-  function limitWindow(label, percent, resetAt, title) {
-    return {
+  function limitWindow(label, percent, resetAt, title, extra) {
+    var window = {
       title: String(title || "") !== "" ? String(title) : windowTitle(label),
       percent: Number(percent),
-      resetAt: String(resetAt || "")
+      resetAt: String(resetAt || ""),
+      soft: false,
+      used: -1,
+      capMin: 0,
+      capMax: 0
     }
+    // A measured-in-minutes window (Live Voice) carries its own figure and the
+    // range it is drawn against; the panel shows them in the tooltip instead of
+    // pretending the percentage is the whole story.
+    if (extra && typeof extra === "object") {
+      if (extra.soft === true) window.soft = true
+      if (extra.used !== undefined && extra.used !== null) window.used = Number(extra.used)
+      if (extra.capMin !== undefined && extra.capMin !== null) window.capMin = Number(extra.capMin)
+      if (extra.capMax !== undefined && extra.capMax !== null) window.capMax = Number(extra.capMax)
+    }
+    return window
   }
 
   function limitWindows(p) {
@@ -409,9 +427,72 @@ Panel {
     for (var i = 0; i < list.length; i++) {
       var entry = list[i] || {}
       var percent = Number(entry.percent)
-      if (percent >= 0) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title))
+      if (percent >= 0) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title, entry))
     }
     return out
+  }
+
+  // The share the meter is drawn from, in words: "80%" alone leaves you guessing
+  // which way it runs, and this is the number a hover is asking for.
+  function percentPair(percent) {
+    var used = Math.round(root.clamp(Number(percent) || 0, 0, 1) * 100)
+    return used + "% used · " + Math.max(0, 100 - used) + "% left"
+  }
+
+  // A window whose figure is minutes rather than a percentage names both the
+  // number and the published range, because "of 60" would misstate a 60–150 min
+  // allowance.
+  function windowValueText(w) {
+    if (!w) return ""
+    if (w.used >= 0 && w.capMin > 0) {
+      var minutes = Math.round(w.used * 10) / 10
+      var cap = Math.round(w.capMin) + (w.capMax > w.capMin ? "–" + Math.round(w.capMax) : "")
+      return minutes + " of ~" + cap + " min"
+    }
+    return percentPair(w.percent)
+  }
+
+  function windowTooltipText(w) {
+    if (!w) return ""
+    var text = w.title + " · " + windowValueText(w)
+    var remainingMs = resetMsFor(w)
+    if (remainingMs > 0) text += " · resets in " + formatDuration(remainingMs)
+    return text
+  }
+
+  // The bar icon answers "how much is left?" without opening the panel: one line
+  // per subscription, naming its tightest real window, plus a measured voice
+  // allowance when there is one. Soft windows never stand in for the tightest
+  // window — their cap is a range, so their percentage is not a countdown.
+  function tightestWindow(p) {
+    var windows = limitWindows(p)
+    var best = null
+    for (var i = 0; i < windows.length; i++) {
+      if (windows[i].soft) continue
+      if (best === null || windows[i].percent > best.percent) best = windows[i]
+    }
+    return best
+  }
+
+  function voiceWindow(p) {
+    var windows = limitWindows(p)
+    for (var i = 0; i < windows.length; i++)
+      if (windows[i].soft) return windows[i]
+    return null
+  }
+
+  function barTooltipText() {
+    var lines = []
+    for (var i = 0; i < providers.length; i++) {
+      var p = providers[i]
+      var parts = [String(p.providerName || p.providerId || "")]
+      var tight = tightestWindow(p)
+      if (tight) parts.push(tight.title + " " + percentPair(tight.percent))
+      var voice = voiceWindow(p)
+      if (voice) parts.push(voice.title.toLowerCase() + " " + windowValueText(voice))
+      if (parts.length > 1) lines.push(parts.join(" · "))
+    }
+    return lines.join("\n")
   }
 
   function resetMsFor(w) {
@@ -564,6 +645,9 @@ Panel {
     bar: root.bar
     text: "󱚣"
     active: root.alarming
+    // Hovering the icon is the fastest read of the whole list: the tightest
+    // window per subscription, in both directions, without opening the panel.
+    tooltipText: root.barTooltipText()
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.launchAgent()
       else if (buttonCode === Qt.MiddleButton) root.scrollToNextCard()
@@ -1159,6 +1243,21 @@ Panel {
     readonly property bool expanded: root.expandedProviderId === (provider ? provider.providerId : "")
     readonly property bool hovered: rowHover.containsMouse
 
+    // Which window line the pointer is on. The card itself is one big click
+    // target, so a line never receives hover on its own; the pointer position is
+    // resolved against the drawn lines instead.
+    readonly property int hoveredLimitIndex: {
+      if (!hovered || !windowColumn || limits.length === 0) return -1
+      var y = rowHover.mouseY
+      var origin = windowColumn.mapToItem(providerRow, 0, 0).y
+      for (var i = 0; i < windowColumn.children.length; i++) {
+        var line = windowColumn.children[i]
+        if (!line || line.height <= 0 || line.visible === false) continue
+        if (y >= origin + line.y && y <= origin + line.y + line.height) return i
+      }
+      return -1
+    }
+
     Rectangle {
       anchors.fill: parent
       radius: Style.cornerRadius
@@ -1325,7 +1424,7 @@ Panel {
         }
       }
 
-    // Clicking the card opens it rather than leaving for the browser: the page
+      // Clicking the card opens it rather than leaving for the browser: the page
       // it would have opened is the first thing inside.
       MouseArea {
         id: rowHover
@@ -1333,6 +1432,18 @@ Panel {
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
         onClicked: root.toggleExpanded(providerRow.provider ? providerRow.provider.providerId : "")
+      }
+
+      // The bar is a picture of one number; the hover says which number, in both
+      // directions, and when the window comes back.
+      PanelToolTip {
+        visible: providerRow.hoveredLimitIndex >= 0
+        text: {
+          var index = providerRow.hoveredLimitIndex
+          if (index < 0 || index >= providerRow.limits.length) return ""
+          return root.windowTooltipText(providerRow.limits[index])
+        }
+        fontFamily: root.fontFamily
       }
   }
 
@@ -1414,9 +1525,11 @@ Panel {
     property bool primary: true
 
     readonly property real gap: Style.space(6)
-    readonly property real labelWidth: Style.space(22)
+    // Wide enough for the longest window name the panel draws ("Voice"), so a
+    // spelled-out label never runs into its own bar.
+    readonly property real labelWidth: Style.space(32)
     readonly property real resetWidth: Style.space(52)
-    readonly property real alarming: window ? window.percent >= 0.9 : false
+    readonly property real alarming: window ? (!window.soft && window.percent >= 0.9) : false
 
     // Fixed so every window's bar starts and ends on the same edge.
     width: Style.space(150)
