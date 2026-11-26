@@ -24,7 +24,44 @@ Panel {
   readonly property color track: Style.selectedFillFor(foreground, Color.accent)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  readonly property var providers: usage.enabledProviders
+  // A record being rewritten between reads reports no figure for a moment, and
+  // a card that loses its figure collapses to a mark and comes back — a flash
+  // on a row that never changed. Keep the last figure each provider reported
+  // and draw that until a new one arrives, so the row is never rebuilt empty.
+  property var figureCache: ({})
+
+  readonly property var providers: {
+    var incoming = usage.enabledProviders
+    var held = figureCache
+    var result = []
+    for (var i = 0; i < incoming.length; i++) {
+      var p = incoming[i]
+      var remembered = hasFigure(p) ? null : held[String(p.providerId)]
+      result.push(remembered && hasFigure(remembered) ? remembered : p)
+    }
+    return result
+  }
+
+  function rememberFigures() {
+    var incoming = usage.enabledProviders
+    var next = {}
+    for (var i = 0; i < incoming.length; i++) {
+      var p = incoming[i]
+      var id = String(p.providerId)
+      if (hasFigure(p))
+        next[id] = p
+      else if (figureCache[id])
+        next[id] = figureCache[id]
+    }
+    figureCache = next
+  }
+
+  Connections {
+    target: usage
+    function onDataRevisionChanged() { root.rememberFigures() }
+  }
+
+  Component.onCompleted: rememberFigures()
 
   // A card earns a full row by having something to meter: a credit balance or a
   // rolling window. A provider we can spend money on but cannot read — Fireworks
