@@ -7,8 +7,10 @@ import qs.Ui
 
 // Every subscription on one screen. A subscription tells you how much of its
 // allowance is left and when it comes back; a pay-per-token account tells you
-// what is still on the meter. Token history lives in the collectors' records
-// for anyone who wants it, but this panel is a balance sheet, not a dashboard.
+// what is still on the meter. That is the balance sheet, and it is what a left
+// click opens. What has already gone — the ledgers, the counts, and the
+// harnesses the next lot goes out from — is the other half of the same records,
+// and it waits behind a right click instead of padding the view you came for.
 Panel {
   id: root
   moduleName: "omarchy.agents"
@@ -45,6 +47,135 @@ Panel {
 
   function hasFigure(p) {
     return !!p && ((p.limits && p.limits.length > 0) || !!p.balance)
+  }
+
+  // ------------------------------------------------------------------- tokens
+
+  // What the collectors' per-model ledgers add up to. modelUsage carries no
+  // dates — the only dated field beside it is a week of message counts — so the
+  // one honest total in these records is a lifetime one, and the block below
+  // labels it that way rather than implying a window the data cannot measure.
+  function tokenCount(value) {
+    var n = Number(value)
+    return isFinite(n) && n > 0 ? n : 0
+  }
+
+  // Cached reads are kept apart from the rest: on a long agent session the cache
+  // column dwarfs every other one, and folded into the total it would make the
+  // figure unreadable and any comparison between providers meaningless.
+  function providerTokens(p) {
+    var usage = (p && p.modelUsage) || ({})
+    var total = 0
+    var cached = 0
+    for (var model in usage) {
+      var bucket = usage[model] || ({})
+      total += tokenCount(bucket.inputTokens) + tokenCount(bucket.outputTokens)
+      cached += tokenCount(bucket.cacheReadInputTokens) + tokenCount(bucket.cacheCreationInputTokens)
+    }
+    return { total: total, cached: cached }
+  }
+
+  // One entry per provider that has a ledger, plus the sum across all of them.
+  // A provider whose collector records no modelUsage contributes nothing and
+  // gets no row — a zero there would read as "used none" rather than "not
+  // measured" — and with no ledgers at all the whole block stays hidden. This
+  // is a binding on the loaded records, not a per-render scan: it recomputes
+  // when the records change and not once per frame.
+  readonly property var tokenLedger: {
+    var rows = []
+    var total = 0
+    var cached = 0
+    for (var i = 0; i < providers.length; i++) {
+      var sums = providerTokens(providers[i])
+      if (sums.total + sums.cached <= 0)
+        continue
+      rows.push({ name: providers[i].providerName, total: sums.total, cached: sums.cached })
+      total += sums.total
+      cached += sums.cached
+    }
+    return { rows: rows, total: total, cached: cached }
+  }
+
+  // A compact figure is what makes two providers comparable at a glance.
+  function formatTokens(value) {
+    var n = tokenCount(value)
+    if (n >= 1e9)
+      return scaledTokens(n / 1e9) + "B"
+    if (n >= 1e6)
+      return scaledTokens(n / 1e6) + "M"
+    if (n >= 1e3)
+      return scaledTokens(n / 1e3) + "K"
+    return String(Math.round(n))
+  }
+
+  // One decimal while it carries information, none once the figure is big
+  // enough that the decimal is only clutter: "1.4M" but "68M".
+  function scaledTokens(scaled) {
+    return scaled >= 100 ? String(Math.round(scaled)) : scaled.toFixed(1).replace(/\.0$/, "")
+  }
+
+  // The figure as it is written everywhere: the total, with cached reads off to
+  // the side. One function rather than one per block, because the panel total
+  // and an open card's own line are the same sentence about different records,
+  // and two copies of it would eventually disagree.
+  function tokenFigureText(total, cached) {
+    var text = formatTokens(total)
+    if (tokenCount(cached) > 0)
+      text += "  +" + formatTokens(cached) + " cache"
+    return text
+  }
+
+  // The same ledger, read one provider at a time for the card that is open. No
+  // second sum: this is `providerTokens` on a single record, laid out as the
+  // lines the details draw. A figure the record does not hold gets no line at
+  // all — a zero there would read as "used none" when the truth is "not
+  // measured" — so an agent that reports only a balance opens to just its link,
+  // and one that reports only counts opens to those alone.
+  function providerUsageRows(p) {
+    var rows = []
+    if (!p) return rows
+    var sums = providerTokens(p)
+    if (sums.total + sums.cached > 0)
+      rows.push({ label: "Tokens", figure: tokenFigureText(sums.total, sums.cached) })
+    // Counts run beside the ledger. A collector that reads only tokens says so
+    // with hasPromptStats, and its prompt count would be a false zero.
+    var prompts = p.hasPromptStats === false ? 0 : tokenCount(p.totalPrompts)
+    if (prompts > 0)
+      rows.push({ label: "Prompts", figure: countText(prompts) })
+    if (tokenCount(p.totalSessions) > 0)
+      rows.push({ label: "Sessions", figure: countText(p.totalSessions) })
+    if (tokenCount(p.activeDays) > 0)
+      rows.push({ label: "Active days", figure: countText(p.activeDays) })
+    return rows
+  }
+
+  // Counts stay whole: "12,431 prompts" is the number, where "12.4K" is only
+  // its size. Grouped by threes in the C convention, matching the money fields
+  // rather than whatever the desktop's locale would do to them.
+  function countText(value) {
+    var digits = String(Math.round(tokenCount(value)))
+    var out = ""
+    for (var i = 0; i < digits.length; i++) {
+      if (i > 0 && (digits.length - i) % 3 === 0) out += ","
+      out += digits.charAt(i)
+    }
+    return out
+  }
+
+  // Prompts and sessions, added up the way the ledger is: across every provider
+  // at once, because "how much has gone" is the one question a per-card view
+  // cannot answer. A collector that reads only tokens says so with
+  // hasPromptStats, and folding its zero in would read as "prompted never".
+  readonly property var usageCounts: {
+    var prompts = 0
+    var sessions = 0
+    for (var i = 0; i < providers.length; i++) {
+      var p = providers[i]
+      if (!p) continue
+      if (p.hasPromptStats !== false) prompts += tokenCount(p.totalPrompts)
+      sessions += tokenCount(p.totalSessions)
+    }
+    return { prompts: prompts, sessions: sessions }
   }
 
   // Where each provider's real numbers live. This is the one place to edit when
@@ -101,6 +232,84 @@ Panel {
 
   readonly property string collectorPath: localPath(Qt.resolvedUrl("bin/omarchy-agent-usage-opencode"))
   readonly property var apiKeyProviderIds: ["deepseek", "openrouter", "opencode-go", "openai-api"]
+
+  // ------------------------------------------------- provider-reported totals
+
+  // The figure each provider's own console reports, which is the only place a
+  // real lifetime number exists: the local records only know what this machine
+  // ran. Every row carries the window its provider actually covers, because the
+  // three differ — DeepSeek keeps the whole account, OpenAI keeps 12 months, and
+  // the OpenCode console keeps one billing period.
+  readonly property string lifetimePath: (Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config") + "/omarchy/agents/lifetime.json"
+  property var lifetimeProviders: []
+  property string lifetimeFetchedAt: ""
+  property string lifetimeApplied: ""
+
+  FileView {
+    id: lifetimeFile
+    path: root.lifetimePath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.applyLifetime(text())
+    // A read that fails once must not blank a block that is still true: the
+    // paragraphs already on screen are the last thing this file said, and the
+    // timestamp under them says how old they are.
+    onLoadFailed: {}
+  }
+
+  function applyLifetime(content) {
+    // Rebuilding the rows replaces the array, and a replaced array tears down
+    // and recreates every Repeater delegate — a visible flash on a row that did
+    // not change. The file only matters when its text does.
+    var loaded = String(content || "")
+    if (loaded === lifetimeApplied) return
+    lifetimeApplied = loaded
+    var parsed = null
+    try { parsed = JSON.parse(String(content || "")) } catch (e) { parsed = null }
+    var entries = parsed && parsed.providers ? parsed.providers : {}
+    var rows = []
+    var order = ["deepseek", "openai", "opencode-go"]
+    for (var i = 0; i < order.length; i++) {
+      var entry = entries[order[i]]
+      if (!entry) continue
+      var tokens = tokenCount(entry.totalTokens)
+      var requests = tokenCount(entry.requests)
+      var spent = Number(entry.spent || 0)
+      var figure = ""
+      if (tokens > 0) figure += formatTokens(tokens) + " tok"
+      if (requests > 0) figure += (figure === "" ? "" : " · ") + countText(requests) + " req"
+      if (spent > 0) figure += (figure === "" ? "" : " · ") + currencyPrefix(entry.spentCurrency) + spent.toFixed(2)
+      rows.push({
+        providerId: order[i],
+        name: entryScopeName(order[i]),
+        window: lifetimeWindowText(entry),
+        figure: figure
+      })
+    }
+    // Money that is not usage on the same card: what the plan has been paid.
+    // Kept apart from the period's tokens so neither reads as the other.
+    var paid = entries["opencode-go"] && Number(entries["opencode-go"].paidLifetime || 0)
+    if (paid > 0)
+      rows.push({ providerId: "opencode-go-paid", name: "OpenCode Go · paid to date", window: "", figure: currencyPrefix(entries["opencode-go"].paidCurrency) + paid.toFixed(2) })
+    root.lifetimeProviders = rows
+    root.lifetimeFetchedAt = String(parsed && parsed.fetchedAt ? parsed.fetchedAt : "")
+  }
+
+  function entryScopeName(providerId) {
+    if (providerId === "deepseek") return "DeepSeek · lifetime"
+    if (providerId === "openai") return "OpenAI · last 12 months"
+    if (providerId === "opencode-go") return "OpenCode Go · this period"
+    return providerId
+  }
+
+  function lifetimeWindowText(entry) {
+    var since = String(entry && entry.since ? entry.since : "")
+    var through = String(entry && entry.through ? entry.through : "")
+    if (since !== "" && through !== "") return since + " → " + through
+    if (since !== "") return "since " + since
+    return ""
+  }
 
   function providerConfigPath(providerId) {
     var configProviders = ["deepseek", "openrouter", "opencode-go", "openai-api", "opencode", "fireworks"]
@@ -176,61 +385,8 @@ Panel {
     return null
   }
 
-  // The cards sharing this one's group, in the order they are drawn. A control
-  // that cannot move anything is not shown at all, so this is what decides
-  // whether each direction is offered.
-  function groupSiblings(p) {
-    var siblings = []
-    if (!p) return siblings
-    var rank = usage.providerRank(p)
-    for (var i = 0; i < providers.length; i++)
-      if (usage.providerRank(providers[i]) === rank) siblings.push(providers[i])
-    return siblings
-  }
-
-  function canMoveToTop(p) {
-    var siblings = groupSiblings(p)
-    return siblings.length > 1 && siblings[0].providerId !== p.providerId
-  }
-
-  function canMoveToBottom(p) {
-    var siblings = groupSiblings(p)
-    return siblings.length > 1 && siblings[siblings.length - 1].providerId !== p.providerId
-  }
-
-  // Moving happens inside a group, never across one: the group answers "what
-  // can I still lose?", which is the reason the list is in this order at all.
-  function moveProvider(p, toTop) {
-    if (!p || root.collectorPath === "") return
-
-    var ids = []
-    for (var i = 0; i < providers.length; i++) ids.push(providers[i].providerId)
-
-    var at = ids.indexOf(p.providerId)
-    if (at === -1) return
-    ids.splice(at, 1)
-
-    // Land on the first or last sibling still in the list.
-    var insertAt = ids.length
-    for (var j = 0; j < ids.length; j++) {
-      var sibling = root.providerById(ids[j])
-      if (!sibling || usage.providerRank(sibling) !== usage.providerRank(p)) continue
-      insertAt = toTop ? j : j + 1
-      if (toTop) break
-    }
-    ids.splice(insertAt, 0, p.providerId)
-
-    // Anything not currently drawn keeps its place at the end rather than being
-    // dropped from the arrangement.
-    var remembered = root.knownProviderIds()
-    for (var k = 0; k < remembered.length; k++)
-      if (ids.indexOf(remembered[k]) === -1) ids.push(remembered[k])
-
-    orderError = ""
-    setOrderProcess.command = [root.collectorPath, "--set-order", ids.join(",")]
-    setOrderProcess.running = true
-  }
-
+  // The one write behind a drag: the arrangement the collector is asked to
+  // remember. Both the reorder and the hide paths go through it.
   Process {
     id: setOrderProcess
     running: false
@@ -257,6 +413,259 @@ Panel {
     id: setHiddenProcess
     running: false
     onExited: function(code) { if (code !== 0) root.orderError = "Could not save" }
+  }
+
+  // ------------------------------------------------------------- dragging
+  //
+  // The hand's version of the two writes above: a card dragged down into the
+  // row of marks collapses to a mark, a mark dragged up out of that row becomes
+  // a card again, and a card dropped in the seam between two cards lands there.
+  // Nothing is written until the pointer comes up, because committing mid-drag
+  // re-sorts the model under the delegate that is holding the pointer and the
+  // drag dies with it.
+  property string dragProviderId: ""
+  // Which way the drag is going. A card can only be dragged down and a mark only
+  // up, so the two gestures never disagree about what a drop means.
+  property bool dragFromCard: false
+  readonly property bool dragging: dragProviderId !== ""
+
+  // The live drop target. Worked out while the pointer moves, then read by the
+  // indicators drawn over the list.
+  property int dropSlot: -1
+  property bool dropOnLinkedRow: false
+  property bool dropOnCards: false
+  // Marks that are marks because there is no number to draw have no card to go
+  // back to, so pulling one out of the row opens the block a click opens. The
+  // gesture means "more of this one" either way; only the destination differs,
+  // and the alternative is a drag that silently does nothing for exactly the
+  // providers that are always marks.
+  property bool dropOpensDetails: false
+  property real dropStripeY: 0
+  property real linkedZoneY: 0
+  property real linkedZoneHeight: 0
+  property real cardZoneY: 0
+  property real cardZoneHeight: 0
+
+  // The cards and the marks meet on an edge that nothing draws, so a mark
+  // released a few pixels short of it used to commit nothing at all — the seam
+  // was a pixel the hand had to hit. Slack on the outward side gives the gesture
+  // a band to land in. Scaled like every other gap here rather than fixed in
+  // pixels.
+  readonly property real dragSeamSlack: Style.space(8)
+
+  // TEMPORARY DIAGNOSTIC — counts the calls one drag makes, so the journal reads
+  // as a path instead of a set of states. Remove with the other DRAGDBG lines.
+  property int dragTicks: 0
+
+  function isDragging(p) { return !!p && dragProviderId === String(p.providerId) }
+
+  function beginDrag(p, fromCard) {
+    dragTicks = 0
+    // TEMPORARY DIAGNOSTIC — remove with the other DRAGDBG lines. The capability
+    // fields are here because the answer to "why did this one never move" is
+    // usually that the provider has nothing to put in a card.
+    console.warn("DRAGDBG beginDrag provider=" + (p ? p.providerId : "null")
+                 + " fromCard=" + fromCard + " collectorPath='" + root.collectorPath + "'"
+                 + " hidden=" + (p ? isHidden(p) : "null")
+                 + " hasFigure=" + (p ? hasFigure(p) : "null")
+                 + " canShow=" + (p ? canShow(p) : "null")
+                 + " canHide=" + (p ? canHide(p) : "null"))
+    if (!p || root.collectorPath === "") return
+    dragProviderId = String(p.providerId)
+    dragFromCard = fromCard
+  }
+
+  // Which seam the pointer is over: before the first card whose middle it has
+  // not passed yet, or after the last one.
+  function dropSlotAt(y) {
+    var cards = cardItems()
+    for (var i = 0; i < cards.length; i++)
+      if (y < cards[i].y + cards[i].height / 2) return i
+    return cards.length
+  }
+
+  // The seam draws on the leading edge of the card at that slot, or under the
+  // last card when the slot is the end of the list.
+  function slotY(slot) {
+    var cards = cardItems()
+    if (cards.length === 0) return 0
+    if (slot >= cards.length) return cards[cards.length - 1].y + cards[cards.length - 1].height
+    return cards[Math.max(0, slot)].y
+  }
+
+  function updateDrag(scenePosition) {
+    if (!root.dragging) return
+    dragTicks++
+    var p = providerById(dragProviderId)
+    // Measured against the drawn cards rather than against the Flickable: the
+    // list can still move mid-drag, and a card that has scrolled is a different
+    // card under the same pointer.
+    var y = column.mapFromItem(null, scenePosition.x, scenePosition.y).y
+    // Where the marks begin. Everything from there down is the collapse zone,
+    // which is a far easier target than the row's own height.
+    var marksTop = linkedRow.visible ? linkedRow.y : -1
+    // The outward edge, opened out by the slack: a mark released just short of
+    // the row's top is asking for the cards, and it used to get nothing at all
+    // because the seam was a pixel the hand had to hit. The card's own edge
+    // stays exact — a card released either side of it always commits something
+    // (the row, or the seam after the last card), so it has nothing to forgive.
+    var outOfRow = marksTop < 0 ? -1 : marksTop + dragSeamSlack
+
+    dropSlot = -1
+    dropOnLinkedRow = false
+    dropOnCards = false
+    dropOpensDetails = false
+
+    if (dragFromCard) {
+      if (p && canHide(p) && marksTop >= 0 && y >= marksTop)
+        dropOnLinkedRow = true
+      else
+        dropSlot = dropSlotAt(y)
+    } else if (p && marksTop >= 0 && y <= outOfRow) {
+      // Out of the row is the whole gesture. Where it lands depends on what the
+      // provider has to show: a hidden card comes back, and one that only ever
+      // was a mark opens the block underneath instead.
+      if (canShow(p))
+        dropOnCards = true
+      else if (!hasFigure(p))
+        dropOpensDetails = true
+    }
+
+    if (dropSlot >= 0)
+      dropStripeY = dragOverlay.mapFromItem(column, 0, slotY(dropSlot)).y
+    if (marksTop >= 0) {
+      linkedZoneY = dragOverlay.mapFromItem(column, 0, marksTop).y
+      linkedZoneHeight = linkedRow.height
+    }
+
+    var cards = cardItems()
+    if (cards.length > 0) {
+      var last = cards[cards.length - 1]
+      cardZoneY = dragOverlay.mapFromItem(column, 0, cards[0].y).y
+      cardZoneHeight = dragOverlay.mapFromItem(column, 0, last.y + last.height).y - cardZoneY
+    }
+
+    // TEMPORARY DIAGNOSTIC — every call, not only the calls that change the
+    // answer, so the journal holds the whole path the pointer took. The
+    // capability fields are the point: a mark with no figure never changed the
+    // answer, so it logged nothing at all and looked like a dead handler.
+    // Remove with the other DRAGDBG lines.
+    console.warn("DRAGDBG update #" + dragTicks
+                 + " provider=" + dragProviderId + " fromCard=" + dragFromCard
+                 + " sceneY=" + Math.round(scenePosition.y)
+                 + " y=" + Math.round(y)
+                 + " marksTop=" + Math.round(marksTop)
+                 + " slack=" + Math.round(dragSeamSlack)
+                 + " slot=" + dropSlot
+                 + " ontoCards=" + dropOnCards + " ontoMarks=" + dropOnLinkedRow
+                 + " ontoDetails=" + dropOpensDetails
+                 + " cardZone=" + Math.round(cardZoneY) + "/" + Math.round(cardZoneHeight)
+                 + " marksZone=" + Math.round(linkedZoneY) + "/" + Math.round(linkedZoneHeight)
+                 + " cards=" + cards.length
+                 + " hidden=" + (p ? isHidden(p) : "null")
+                 + " hasFigure=" + (p ? hasFigure(p) : "null")
+                 + " canShow=" + (p ? canShow(p) : "null")
+                 + " canHide=" + (p ? canHide(p) : "null"))
+  }
+
+  // The release is the only thing that writes. One drop means one call.
+  function endDrag() {
+    var p = providerById(dragProviderId)
+    var slot = dropSlot
+    var ontoMarks = dropOnLinkedRow
+    var ontoCards = dropOnCards
+    var ontoDetails = dropOpensDetails
+    var dropped = dragProviderId
+    var ticks = dragTicks
+    resetDrag()
+    // TEMPORARY DIAGNOSTIC — the answer and the write it turns into, so a release
+    // that commits nothing says which of the two was empty. Remove with the
+    // other DRAGDBG lines.
+    var action = "none"
+    if (!p) action = "noProvider"
+    else if (ontoMarks) action = "hide"
+    else if (ontoCards) action = "show"
+    else if (ontoDetails) action = "details"
+    else if (slot >= 0) action = "reorder"
+    console.warn("DRAGDBG endDrag provider=" + dropped + " ticks=" + ticks
+                 + " slot=" + slot + " ontoMarks=" + ontoMarks + " ontoCards=" + ontoCards
+                 + " ontoDetails=" + ontoDetails + " action=" + action)
+    if (!p) return
+    if (ontoMarks) setHidden(p, true)
+    else if (ontoCards) setHidden(p, false)
+    else if (ontoDetails) expandedProviderId = String(p.providerId)
+    else if (slot >= 0) reorderProvider(p, slot)
+  }
+
+  // A drag Qt takes away — Esc, the panel closing, a second pointer — writes
+  // nothing at all.
+  function resetDrag() {
+    dragProviderId = ""
+    dragFromCard = false
+    dropSlot = -1
+    dropOnLinkedRow = false
+    dropOnCards = false
+    dropOpensDetails = false
+    dragTicks = 0
+  }
+
+  // Landing a card in a seam. The slot counts positions in the list as it was
+  // drawn, so pulling the card out of that list first moves every seam below it
+  // up by one. What is left is then held to the group, for the same reason the
+  // move functions were: the group is the rule, and a subscription can never be
+  // stored below a prepaid account.
+  function reorderProvider(p, slot) {
+    if (!p || root.collectorPath === "") return
+
+    var drawn = []
+    for (var i = 0; i < root.meteredProviders.length; i++)
+      drawn.push(String(root.meteredProviders[i].providerId))
+    var from = drawn.indexOf(String(p.providerId))
+    if (from === -1) return
+    drawn.splice(from, 1)
+
+    var at = slot > from ? slot - 1 : slot
+    var rank = usage.providerRank(p)
+    var lo = drawn.length
+    var hi = drawn.length
+    for (var j = 0; j < drawn.length; j++) {
+      var sibling = root.providerById(drawn[j])
+      if (!sibling || usage.providerRank(sibling) !== rank) continue
+      if (lo === drawn.length) lo = j
+      hi = j + 1
+    }
+    // Nothing of its own group left to slide past: the rank decides this one's
+    // place, and a write for it would only be noise.
+    if (lo === hi) return
+    at = root.clamp(at, lo, hi)
+
+    // The seam is expressed against the card on its far side, so the write only
+    // has to say "put this one before that one". Whatever else the collector
+    // remembers about ids this list does not draw keeps its place around them.
+    var anchorId = at < drawn.length ? drawn[at] : drawn[drawn.length - 1]
+
+    var ids = []
+    for (var k = 0; k < providers.length; k++) ids.push(providers[k].providerId)
+    var remembered = root.knownProviderIds()
+    for (var m = 0; m < remembered.length; m++)
+      if (ids.indexOf(remembered[m]) === -1) ids.push(remembered[m])
+
+    var current = ids.join(",")
+    var removedAt = ids.indexOf(p.providerId)
+    if (removedAt === -1) return
+    ids.splice(removedAt, 1)
+
+    var anchorAt = ids.indexOf(anchorId)
+    if (anchorAt === -1) return
+    ids.splice(at < drawn.length ? anchorAt : anchorAt + 1, 0, p.providerId)
+
+    // A drop back where it started is not a change, and a write for it would
+    // only make the card flicker.
+    if (ids.join(",") === current) return
+
+    orderError = ""
+    setOrderProcess.command = [root.collectorPath, "--set-order", ids.join(",")]
+    setOrderProcess.running = true
   }
 
   Process {
@@ -324,26 +733,38 @@ Panel {
     usage.refreshAll(true)
   }
 
-  // ---------------------------------------------------------- the harnesses
+  // ---------------------------------------------------------- the usage view
   //
-  // Right-click answers a different question than the panel does: not "how much
-  // is left?" but "where am I going out to spend it?". The list comes from the
-  // plugin's own script, so it names only harnesses that are installed here and
-  // a new one appears without an edit to this file.
-  property bool launcherMode: false
+  // Two questions, two clicks. Left click is the balance sheet: what is left on
+  // each meter. Right click is consumption: what has already gone, and where the
+  // next lot goes out from. Both are this one panel in a different mode, not two
+  // surfaces: the panel already owns input, focus and Esc, which a nested popup
+  // inside a popup does not reliably get.
+  property bool usageMode: false
   property var harnesses: []
 
   readonly property string harnessScript: localPath(Qt.resolvedUrl("bin/omarchy-agent-harnesses"))
 
-  // The launcher is the panel in a second mode, not a second surface: the panel
-  // already owns input, focus and Esc, which a nested popup inside a popup does
-  // not reliably get.
-  function openLauncher() {
-    if (harnessScript === "") return
-    launcherMode = true
-    refreshHarnesses()
+  function openUsage() {
+    usageMode = true
+    if (harnessScript !== "") refreshHarnesses()
     if (!root.opened) root.open()
-    harnessColumnFlick.contentY = 0
+    if (panelFlick) panelFlick.contentY = 0
+  }
+
+  // The same gesture takes the view away again, so one click is the whole trip
+  // out and back and nothing can be left showing that was not asked for.
+  function toggleUsage() {
+    if (root.opened && usageMode) root.close()
+    else root.openUsage()
+  }
+
+  // Back to the balance sheet without closing anything: the left click and the
+  // way out of the usage view are the same destination, so the two cannot
+  // disagree about which view is showing.
+  function showCapacity() {
+    usageMode = false
+    if (panelFlick) panelFlick.contentY = 0
   }
 
   function refreshHarnesses() {
@@ -588,7 +1009,11 @@ Panel {
   function balanceLabel(providerId, api) {
     if (api) return "API Balance"
     var id = String(providerId || "")
-    if (id === "opencode-go") return "Zen Balance"
+    // OpenCode Go spends from the same wallet as Zen, and its console calls
+    // what is left "available credit", so the row uses the console's own word.
+    // The figure stays a dollar amount like every other money row; only the
+    // label is provider-specific.
+    if (id === "opencode-go") return "Credit"
     if (id === "openai") return "Credits"
     return "Balance"
   }
@@ -631,11 +1056,24 @@ Panel {
 
   function iconCandidatesForProvider(p, surfaceColor) {
     if (!p) return []
+    var base = assetBaseFor(p.providerId)
     var candidates = []
     if (colorLuminance(surfaceColor || Color.background) >= 0.5)
-      candidates.push(Qt.resolvedUrl("assets/" + p.providerId + "-light.svg"))
-    candidates.push(Qt.resolvedUrl("assets/" + p.providerId + ".svg"))
+      candidates.push(Qt.resolvedUrl("assets/" + base + "-light.svg"))
+    candidates.push(Qt.resolvedUrl("assets/" + base + ".svg"))
     return candidates
+  }
+
+  // opencode records real provider ids, and several of them are a variant of
+  // the account whose mark ships (hermes-local runs on the Hermes account,
+  // github-copilot on Copilot's). A literal id lookup misses, the Image errors,
+  // and the failed load repeats on every repaint and every record refresh. Map
+  // the id onto the family that owns the mark instead.
+  function assetBaseFor(providerId) {
+    var id = String(providerId || "")
+    if (id.indexOf("hermes") === 0) return "hermes"
+    if (id.indexOf("copilot") !== -1) return "github-copilot"
+    return id
   }
 
   // Only speaks up when the numbers cover more than this machine.
@@ -657,9 +1095,17 @@ Panel {
     nowMs = Date.now()
     // A fresh look at fresh numbers: start collapsed every time.
     expandedProviderId = ""
+    // A panel that closed mid-drag never got its release, and a card left in
+    // flight would take the list's scrolling away for good.
+    resetDrag()
     if (panelFlick) panelFlick.contentY = 0
     usage.refreshLimits()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  } else {
+    // No view outlives the close. The next open is the balance sheet unless the
+    // click that opens it asks for the usage view, so the panel cannot come back
+    // in a mode nobody chose.
+    usageMode = false
   }
 
   Main {
@@ -678,15 +1124,20 @@ Panel {
 
   IpcHandler {
     target: root.ipcTarget
-    function open(): void { root.launcherMode = false; root.open() }
+    function open(): void { root.usageMode = false; root.open() }
     function close(): void { root.close() }
-    function show(): void { root.launcherMode = false; root.open() }
+    function show(): void { root.usageMode = false; root.open() }
     function hide(): void { root.close() }
-    function toggle(): void { if (!root.opened) root.launcherMode = false; root.toggle() }
+    function toggle(): void { if (!root.opened) root.usageMode = false; root.toggle() }
     function refresh(): string { root.refreshNow(); return "ok" }
     function next(): string { root.scrollToNextCard(); return "ok" }
-    // Right-click has no IPC equivalent, so the launcher gets a name of its own.
-    function launcher(): string { root.openLauncher(); return "ok" }
+    // Right-click has no IPC equivalent either way, so each view gets a name of
+    // its own. `launcher` keeps its old name and now opens the usage view, which
+    // is where the harness list lives, so a keybinding written for it still
+    // lands on the list.
+    function usage(): string { root.openUsage(); return "ok" }
+    function launcher(): string { root.openUsage(); return "ok" }
+    function capacity(): string { if (!root.opened) root.open(); root.showCapacity(); return "ok" }
     // Launch one harness directly, for a keybinding or a script.
     function run(id: string): string { root.launchHarness(id); return "ok" }
   }
@@ -700,10 +1151,14 @@ Panel {
     // Hovering the icon is the fastest read of the whole list: the tightest
     // window per subscription, in both directions, without opening the panel.
     tooltipText: root.barTooltipText()
+    // Left is capacity, right is usage. Left stays the way in and the way out of
+    // the other view — reaching the balance sheet is one click from either mode,
+    // which is what keeps a mode from being a place to get stuck.
     onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) root.openLauncher()
+      if (buttonCode === Qt.RightButton) root.toggleUsage()
       else if (buttonCode === Qt.MiddleButton) root.scrollToNextCard()
-      else { root.launcherMode = false; root.toggle() }
+      else if (root.opened && root.usageMode) root.showCapacity()
+      else { root.usageMode = false; root.toggle() }
     }
   }
 
@@ -715,7 +1170,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(root.launcherMode ? harnessColumn.implicitHeight : column.implicitHeight, Style.space(640))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(640))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -732,14 +1187,16 @@ Panel {
 
       Flickable {
         id: panelFlick
-        visible: !root.launcherMode
         anchors.fill: parent
         contentWidth: width
         contentHeight: column.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
-        interactive: contentHeight > height
+        // A card being dragged owns the pointer: letting the list scroll at the
+        // same time would carry the seam out from under the card that is aiming
+        // for it.
+        interactive: !root.dragging && contentHeight > height
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
         Column {
@@ -747,8 +1204,22 @@ Panel {
           width: panelFlick.width
           spacing: Style.space(8)
 
+          // ---------- capacity ----------
+          // Everything a left click opens, and nothing else: what is left on each
+          // meter. The consumption side is the usage view further down, and the
+          // two are never on screen together, so neither pads the other.
+
+          PanelHero {
+            width: parent.width
+            visible: !root.usageMode
+            title: "Agents"
+            meta: root.meteredProviders.length + " metered · " + root.linkedProviders.length + " linked"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
           Text {
-            visible: root.providers.length === 0
+            visible: !root.usageMode && root.providers.length === 0
             width: parent.width
             topPadding: Style.space(24)
             text: "No AI coding subscriptions found.\nAgents show up here once you've used them."
@@ -759,16 +1230,27 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          PanelSectionHeader {
+            visible: !root.usageMode
+            text: "Subscriptions"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
           Repeater {
             model: root.meteredProviders
 
             ProviderRow {
               provider: modelData
+              // The card hides with the rest of the balance sheet; the row itself
+              // is what a Column lays out, so the mode is decided here and not on
+              // the Repeater.
+              visible: !root.usageMode
             }
           }
 
           PanelSeparator {
-            visible: root.linkedProviders.length > 0 && root.meteredProviders.length > 0
+            visible: !root.usageMode && root.linkedProviders.length > 0 && root.meteredProviders.length > 0
             foreground: root.foreground
           }
 
@@ -776,7 +1258,7 @@ Panel {
           // link to the page that has them.
           Row {
             id: linkedRow
-            visible: root.linkedProviders.length > 0
+            visible: !root.usageMode && root.linkedProviders.length > 0
             width: parent.width
             spacing: Style.spacing.md
 
@@ -800,7 +1282,7 @@ Panel {
           // taller than its neighbours.
           ProviderDetails {
             id: linkedDetails
-            visible: root.expandedProviderId !== "" && root.linkedProviders.some(function(p) {
+            visible: !root.usageMode && root.expandedProviderId !== "" && root.linkedProviders.some(function(p) {
               return p.providerId === root.expandedProviderId
             })
             provider: root.linkedProviders.find(function(p) {
@@ -809,9 +1291,16 @@ Panel {
             width: parent.width
           }
 
+          PanelSectionHeader {
+            visible: !root.usageMode && root.syncFooter() !== ""
+            text: "Status"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
           Text {
             textFormat: Text.PlainText
-            visible: text !== ""
+            visible: !root.usageMode && text !== ""
             width: parent.width
             topPadding: Style.space(4)
             text: root.syncFooter()
@@ -821,88 +1310,336 @@ Panel {
             horizontalAlignment: Text.AlignHCenter
             elide: Text.ElideRight
           }
-        }
-      }
-      // Right-click's list: the same surface and the same keys, one row per
-      // harness this machine actually has.
-      Flickable {
-        id: harnessColumnFlick
-        anchors.fill: parent
-        visible: root.launcherMode
-        contentWidth: width
-        contentHeight: harnessColumn.implicitHeight
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
-        flickableDirection: Flickable.VerticalFlick
-        interactive: contentHeight > height
 
-        Column {
-          id: harnessColumn
-          width: harnessColumnFlick.width
-          spacing: Style.space(2)
-
-          Text {
-            textFormat: Text.PlainText
+          // ---------- usage ----------
+          // Right click's side of the panel: what has already gone rather than
+          // what is left. The same ledgers the cards read, added up across every
+          // provider, because a total is the one thing a per-card view cannot
+          // tell you. These are lifetime figures, the only kind these records
+          // hold, so the hero says "all time" rather than letting a reader assume
+          // a month. Cached reads ride along on each line because they are real
+          // spend, but off to the side: on opencode-go they are several times
+          // everything else.
+          Column {
+            id: usageView
             width: parent.width
-            text: "Open a harness"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            font.bold: true
-            topPadding: Style.space(2)
-            bottomPadding: Style.space(4)
+            visible: root.usageMode
+            spacing: Style.space(8)
+
+            PanelHero {
+              width: parent.width
+              title: "Usage"
+              meta: "all time"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              // The way back, in words and in reach. A mode you leave by
+              // guessing is a trap, and the hero reserves the space itself.
+              trailingControl: capacityButton
+            }
+
+            // What each provider says about itself. This block sits above the
+            // local ledger because it is the better number: the rows below can
+            // only see sessions opencode recorded here, while this is the
+            // account's own total, windows included in the labels.
+            Column {
+              id: reportedBlock
+              width: parent.width
+              visible: root.lifetimeProviders.length > 0
+              spacing: Style.space(2)
+
+              PanelSectionHeader {
+                text: "Provider-reported"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Repeater {
+                model: root.lifetimeProviders
+
+                UsageLine {
+                  required property var modelData
+                  width: reportedBlock.width
+                  label: modelData.name
+                  figure: modelData.figure
+                  note: modelData.window
+                }
+              }
+            }
+
+            Column {
+              id: tokenBlock
+              width: parent.width
+              visible: root.tokenLedger.rows.length > 0
+              spacing: Style.space(2)
+
+              Repeater {
+                model: root.tokenLedger.rows
+
+                UsageLine {
+                  required property var modelData
+                  width: tokenBlock.width
+                  label: modelData.name
+                  figure: root.tokenFigureText(modelData.total, modelData.cached)
+                }
+              }
+
+              // The grand total earns a rule and its own line: it is the one
+              // figure here that is not a single provider. With a single ledger
+              // it would only repeat the row above it, so it waits for a second.
+              PanelSeparator {
+                visible: root.tokenLedger.rows.length > 1
+                foreground: root.foreground
+              }
+
+              UsageLine {
+                visible: root.tokenLedger.rows.length > 1
+                width: tokenBlock.width
+                emphasized: true
+                label: "All providers"
+                figure: root.tokenFigureText(root.tokenLedger.total, root.tokenLedger.cached)
+              }
+            }
+
+            // Prompts and sessions beside the tokens, in the same shape: counts
+            // stay whole here, where "12.4K" would only be their size. These are
+            // the sums, not per-provider figures — a card already opens to its
+            // own counts — so the header says whose they are. A record that holds
+            // neither figure gets no block at all.
+            Column {
+              id: countsBlock
+              width: parent.width
+              visible: root.usageCounts.prompts > 0 || root.usageCounts.sessions > 0
+              spacing: Style.space(2)
+
+              PanelSectionHeader {
+                text: "Counts · all providers"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              UsageLine {
+                visible: root.usageCounts.prompts > 0
+                width: countsBlock.width
+                label: "Prompts"
+                figure: root.countText(root.usageCounts.prompts)
+              }
+
+              UsageLine {
+                visible: root.usageCounts.sessions > 0
+                width: countsBlock.width
+                label: "Sessions"
+                figure: root.countText(root.usageCounts.sessions)
+              }
+            }
+
+            PanelSeparator {
+              visible: root.harnesses.length > 0
+              foreground: root.foreground
+            }
+
+            // Where the next lot goes out from. The list comes from the plugin's
+            // own script, so it names only harnesses installed here and a new one
+            // appears without an edit to this file.
+            Column {
+              id: harnessList
+              width: parent.width
+              visible: root.harnesses.length > 0
+              spacing: Style.space(2)
+
+              PanelSectionHeader {
+                text: "Open a harness"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Repeater {
+                model: root.harnesses
+
+                delegate: Item {
+                  id: harnessRow
+                  required property var modelData
+                  width: parent.width
+                  height: Style.spacing.controlHeight
+
+                  Rectangle {
+                    anchors.fill: parent
+                    radius: Style.cornerRadius
+                    color: harnessHover.containsMouse ? root.alpha(root.foreground, 0.09) : "transparent"
+
+                    Behavior on color { ColorAnimation { duration: 120 } }
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: harnessRow.modelData ? String(harnessRow.modelData.label || "") : ""
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: harnessRow.modelData ? String(harnessRow.modelData.detail || "") : ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  MouseArea {
+                    id: harnessHover
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.launchHarness(harnessRow.modelData ? harnessRow.modelData.id : "")
+                  }
+                }
+              }
+            }
           }
 
-          Repeater {
-            model: root.harnesses
+          // The usage view's way out, handed to the hero above as its trailing
+          // control. Declared once, because a Component takes no room in a Column.
+          Component {
+            id: capacityButton
 
-            delegate: Item {
-              id: harnessRow
-              required property var modelData
-              width: parent.width
-              height: Style.spacing.controlHeight
-
-              Rectangle {
-                anchors.fill: parent
-                radius: Style.cornerRadius
-                color: harnessHover.containsMouse ? root.alpha(root.foreground, 0.09) : "transparent"
-
-                Behavior on color { ColorAnimation { duration: 120 } }
-              }
-
-              Text {
-                textFormat: Text.PlainText
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                text: harnessRow.modelData ? String(harnessRow.modelData.label || "") : ""
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-
-              Text {
-                textFormat: Text.PlainText
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                text: harnessRow.modelData ? String(harnessRow.modelData.detail || "") : ""
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              MouseArea {
-                id: harnessHover
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.launchHarness(harnessRow.modelData ? harnessRow.modelData.id : "")
-              }
+            Button {
+              text: "Balances"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              verticalPadding: Style.space(4)
+              onClicked: root.showCapacity()
             }
           }
         }
       }
+
+      // ---------- what a drag draws ----------
+      // Above the list rather than inside it: an indicator that took part in the
+      // layout would push the cards apart and change the answer it is drawing.
+      // None of it takes the pointer — the handler that started the drag holds
+      // that until the release.
+      Item {
+        id: dragOverlay
+        anchors.fill: parent
+        visible: root.dragging
+
+        // Down into the marks: the row itself lights up, because the row is what
+        // the card is asking to become. The band is padded by a gap so the
+        // highlight covers the whole gesture rather than only the row's height.
+        // A mark with nothing to meter lights the same band on the way out: the
+        // block it opens appears under the row, so the row is where it lands.
+        Rectangle {
+          x: 0
+          y: root.linkedZoneY - Style.spacing.md / 2
+          width: dragOverlay.width
+          height: root.linkedZoneHeight + Style.spacing.md
+          visible: root.dropOnLinkedRow || root.dropOpensDetails
+          radius: Style.cornerRadius
+          color: root.alpha(Color.accent, 0.16)
+
+          Behavior on color { ColorAnimation { duration: 120 } }
+        }
+
+        // Up out of the marks: the band the cards live in lights up, because the
+        // mark is asking for a card somewhere in it.
+        Rectangle {
+          x: 0
+          y: root.cardZoneY
+          width: dragOverlay.width
+          height: root.cardZoneHeight
+          visible: root.dropOnCards
+          radius: Style.cornerRadius
+          color: root.alpha(Color.accent, 0.16)
+        }
+
+        // The seam the card would land in. A rule rather than a card-sized hole,
+        // so the answer to "where would it go?" is one line to read.
+        Rectangle {
+          x: 0
+          y: root.dropStripeY - height / 2
+          width: dragOverlay.width
+          height: Style.space(2)
+          visible: root.dropSlot >= 0
+          radius: height / 2
+          color: Color.accent
+        }
+      }
+    }
+  }
+
+  // One labelled figure: the shape the panel's token block and an open card's
+  // usage section both draw. Anchored rather than a Row for the same reason the
+  // window lines are — the label elides against the figure, and the two share a
+  // baseline without a positioner having to decide it.
+  component UsageLine: Item {
+    id: usageLine
+    property string label: ""
+    property string figure: ""
+    // The one line that is a sum of the others, wherever it is drawn.
+    property bool emphasized: false
+    // The window behind a figure, when the figure does not cover everything.
+    // It is a second line rather than part of the label so the number stays
+    // readable and the caveat stays attached to it.
+    property string note: ""
+
+    width: parent ? parent.width : implicitWidth
+    implicitHeight: usageRow.height + (usageNote.visible ? usageNote.implicitHeight + Style.space(1) : 0)
+    height: implicitHeight
+
+    Item {
+      id: usageRow
+      width: parent.width
+      height: Math.max(usageLabel.implicitHeight, usageFigure.implicitHeight)
+
+      Text {
+        id: usageLabel
+        textFormat: Text.PlainText
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        width: usageRow.width - usageFigure.width - Style.spacing.md
+        text: usageLine.label
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: usageLine.emphasized
+        elide: Text.ElideRight
+      }
+
+      Text {
+        id: usageFigure
+        textFormat: Text.PlainText
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: usageLine.figure
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: usageLine.emphasized
+        horizontalAlignment: Text.AlignRight
+      }
+    }
+
+    Text {
+      id: usageNote
+      textFormat: Text.PlainText
+      visible: usageLine.note !== ""
+      anchors.top: usageRow.bottom
+      anchors.topMargin: Style.space(1)
+      anchors.left: parent.left
+      width: parent.width
+      text: usageLine.note
+      color: root.dim
+      opacity: 0.75
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
     }
   }
 
@@ -922,6 +1659,10 @@ Panel {
     readonly property string configPath: root.providerConfigPath(provider ? provider.providerId : "")
     readonly property var resets: provider && provider.resets ? provider.resets : null
     readonly property string balanceStatusText: provider ? String(provider.balanceStatusText || "") : ""
+    // What this one record holds: its own ledger and the counts beside it. A
+    // binding over the loaded record, so it is recomputed when the card's
+    // provider is replaced, not once per frame.
+    readonly property var usageRows: root.providerUsageRows(provider)
 
     // Fill from whatever is already recorded each time the card opens, and
     // leave it alone while it is open so a refresh cannot wipe out typing.
@@ -948,8 +1689,38 @@ Panel {
     topPadding: Style.space(4)
     spacing: Style.space(4)
 
-    // The link comes first: it is the thing you reach for most, and it is the
-    // only one every provider has.
+    // ---------- usage ----------
+    // The figures come first, because they are what the card was opened to see,
+    // and they are drawn in the same family as the block under the list: what
+    // this one account has spent, then the counts its collector keeps beside
+    // the tokens. Every line comes from the record, so an agent that reports a
+    // balance and nothing else opens to its links alone and no empty heading.
+    Column {
+      id: usageSection
+      visible: providerDetails.usageRows.length > 0
+      width: parent.width
+      spacing: Style.space(2)
+
+      PanelSectionHeader {
+        text: "Usage · all time"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+      }
+
+      Repeater {
+        model: providerDetails.usageRows
+
+        UsageLine {
+          required property var modelData
+          width: usageSection.width
+          label: modelData.label
+          figure: modelData.figure
+        }
+      }
+    }
+
+    // Then the way out: the page with the numbers this record cannot read, and
+    // the one thing every provider has.
     Item {
       visible: providerDetails.url !== ""
       width: parent.width
@@ -1190,51 +1961,6 @@ Panel {
       onClicked: root.editApiKeyFile()
     }
 
-    // Reordering, inside the group. Two buttons rather than a drag: dragging is
-    // a lot of machinery for a list this short, and this needs no tutorial.
-    Row {
-      id: moveRow
-      width: parent.width
-      spacing: Style.spacing.md
-
-      // The row decides from the same source the buttons do, rather than from
-      // the buttons' own `visible`: a row that reads its children's visibility
-      // evaluates before they do and stays hidden for good.
-      readonly property bool canTop: root.canMoveToTop(providerDetails.provider)
-      readonly property bool canBottom: root.canMoveToBottom(providerDetails.provider)
-      // One button gets the full width; there is no empty half to leave behind.
-      readonly property int visibleCount: (canTop ? 1 : 0) + (canBottom ? 1 : 0)
-      readonly property real cellWidth: visibleCount > 0
-        ? (width - spacing * (visibleCount - 1)) / visibleCount
-        : 0
-
-      visible: visibleCount > 0
-
-      Button {
-        id: topButton
-        visible: moveRow.canTop
-        width: visible ? moveRow.cellWidth : 0
-        text: "Move to top"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        fontSize: Style.font.bodySmall
-        verticalPadding: Style.space(4)
-        onClicked: root.moveProvider(providerDetails.provider, true)
-      }
-
-      Button {
-        id: bottomButton
-        visible: moveRow.canBottom
-        width: visible ? moveRow.cellWidth : 0
-        text: "Move to bottom"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        fontSize: Style.font.bodySmall
-        verticalPadding: Style.space(4)
-        onClicked: root.moveProvider(providerDetails.provider, false)
-      }
-    }
-
     Row {
       id: visibilityRow
       visible: root.canHide(providerDetails.provider) || root.canShow(providerDetails.provider)
@@ -1374,7 +2100,16 @@ Panel {
     implicitHeight: summary.implicitHeight + (details.visible ? details.height + Style.spacing.md : 0)
 
     readonly property bool expanded: root.expandedProviderId === (provider ? provider.providerId : "")
-    readonly property bool hovered: rowHover.containsMouse
+    readonly property bool hovered: rowHover.containsMouse || gripHover.hovered
+    // A card in flight lifts: dimmed and a hair larger, which reads as "held"
+    // without a copy of it having to chase the pointer through a positioner.
+    readonly property bool lifted: root.isDragging(provider) && root.dragFromCard
+
+    opacity: lifted ? 0.72 : 1
+    scale: lifted ? 1.02 : 1
+
+    Behavior on opacity { NumberAnimation { duration: 120 } }
+    Behavior on scale { NumberAnimation { duration: 120 } }
 
     // Which window line the pointer is on. The card itself is one big click
     // target, so a line never receives hover on its own; the pointer position is
@@ -1567,6 +2302,71 @@ Panel {
         onClicked: root.toggleExpanded(providerRow.provider ? providerRow.provider.providerId : "")
       }
 
+      // ---------- the handle ----------
+      // The mark and the name are what you grab. The meters on the right are not
+      // part of it: they are the numbers, and a gesture that started on a bar
+      // would be a gesture about a bar. Everything a drag needs to know about
+      // the list is decided here, before the Flickable is asked to give up the
+      // pointer, so a scroll that begins over a figure still scrolls.
+      Item {
+        id: grip
+        // The right edge stops where the meters start. It is expressed as a
+        // width, not as an anchor to `trailing`: `trailing` belongs to
+        // `summary`, and Qt refuses an anchor to anything that is not a parent
+        // or a sibling — silently, leaving this item zero wide. A zero-wide
+        // handle is an invisible one: no hand cursor, no drag, no nothing.
+        // Measuring the same edge as a number keeps both ends where the layout
+        // put them.
+        anchors.left: parent.left
+        anchors.top: parent.top
+        // The summary row only: an open card's buttons are not a handle, and a
+        // grip stretched over them would turn a drag that started on a button
+        // into a drag about the card.
+        anchors.bottom: summary.bottom
+        // A card with no meters and no balance has nothing in `trailing`, so
+        // measuring to it yields zero and the whole logo-and-name area stops
+        // being a handle. Fall back to the full row: a card with no figure to
+        // protect is entirely grip.
+        width: trailing.x > 0 ? trailing.x : parent.width
+        // The hand cursor is chosen by paint order, so this has to stay above
+        // the card's click target rather than merely after it in the file.
+        z: 1
+
+        HoverHandler {
+          id: gripHover
+          cursorShape: gripDrag.active ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+        }
+
+        DragHandler {
+          id: gripDrag
+          // Nothing follows the pointer: the card is one cell of a positioner,
+          // and moving it would re-lay out the list it is describing. The lift
+          // on the card and the seam drawn over the list do the talking instead.
+          target: null
+          // Vertical only, so a sideways swipe across the name is still a swipe.
+          xAxis.enabled: false
+          // The press belongs to the card's own click target until this decides
+          // it has become a drag.
+          grabPermissions: PointerHandler.CanTakeOverFromAnything
+
+          onActiveChanged: {
+            if (active) {
+              root.beginDrag(providerRow.provider, true)
+              // Put the seam where the drag started, so the first answer is
+              // already on screen when the card lifts.
+              root.updateDrag(centroid.scenePosition)
+            } else {
+              root.endDrag()
+            }
+          }
+          // `centroid`, not `point`: the single-point `point` property is not in
+          // scope inside a handler and reads as an error, which silently killed
+          // every update after it — the drag never worked out a drop slot at all.
+          onActiveTranslationChanged: if (active) root.updateDrag(centroid.scenePosition)
+          onCanceled: root.resetDrag()
+        }
+      }
+
       // The bar is a picture of one number; the hover says which number, in both
       // directions, and when the window comes back.
       PanelToolTip {
@@ -1625,8 +2425,40 @@ Panel {
       id: buttonHover
       anchors.fill: parent
       hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
+      // No cursor here on purpose: this is the whole mark, and the grab hand
+      // from the handler below has to win. A cursor set on a child beats the
+      // parent's handler, so setting one here would hide the hand.
       onClicked: root.toggleExpanded(linkedButton.provider ? linkedButton.provider.providerId : "")
+    }
+
+    // A mark is small enough that all of it is the handle: dragging one up out
+    // of the row is the only way back to a card, so there is no corner of it
+    // left over for something else. A drag that lands back in the row changes
+    // nothing, which is why only the upward direction is wired to anything.
+    DragHandler {
+      id: markDrag
+      target: null
+      xAxis.enabled: false
+      grabPermissions: PointerHandler.CanTakeOverFromAnything
+
+      onActiveChanged: {
+        if (active) {
+          root.beginDrag(linkedButton.provider, false)
+          root.updateDrag(centroid.scenePosition)
+        } else {
+          root.endDrag()
+        }
+      }
+      // `centroid`, not `point`: see the note on the card's handler.
+      onActiveTranslationChanged: if (active) root.updateDrag(centroid.scenePosition)
+      onCanceled: root.resetDrag()
+    }
+
+    // The cursor belongs to this handler, not to the MouseArea above: a child
+    // that sets a cursor is resolved before its parent's handlers are, so the
+    // mark kept showing the click hand instead of the grab hand.
+    HoverHandler {
+      cursorShape: markDrag.active ? Qt.ClosedHandCursor : Qt.OpenHandCursor
     }
 
     // With only a logo on screen, the tooltip carries the name — and any reason
