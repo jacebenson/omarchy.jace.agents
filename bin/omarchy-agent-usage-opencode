@@ -151,7 +151,7 @@ UPSTREAM_PROVIDER_IDS = {"fireworks-ai", "anthropic"}
 # Go exposes rolling subscription limits while Zen exposes the prepaid credit
 # balance. Fold both provider IDs into one OpenCode Go card so the panel has one
 # entry with both kinds of information.
-CARD_FOLDS = {"codex": "openai", "opencode": "opencode-go", "openai-api": "openai"}
+CARD_FOLDS = {"opencode": "opencode-go", "openai-api": "openai"}
 
 # Local endpoints and free tiers: nothing to subscribe to, nothing to track.
 # Replicate is NOT here: it is a paid account with no usage API, and the panel
@@ -159,8 +159,13 @@ CARD_FOLDS = {"codex": "openai", "opencode": "opencode-go", "openai-api": "opena
 IGNORED_PROVIDER_IDS: set[str] = set()
 IGNORED_PROVIDER_PREFIXES = ("ollama", "localhost", "lmstudio", "llamacpp", "vllm")
 
+# opencode renamed its part table (part -> session_part) between builds, so the
+# name is discovered rather than assumed: a hardcoded table name aborts the
+# whole scan with "no such table" and every provider reads as unused.
+STEP_PART_TABLES = ("part", "session_part")
+
 STEP_PART_SQL = (
-  "SELECT session_id, data, time_created FROM part"
+  "SELECT session_id, data, time_created FROM {table}"
   " WHERE data LIKE '%\"step-finish\"%'"
   " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.type') END = 'step-finish'"
 )
@@ -352,6 +357,55 @@ def is_tracked(provider_id: str, cards: dict[str, dict[str, Any]]) -> bool:
 # ---------------------------------------------------------------------- scan
 
 
+def step_rows(conn: sqlite3.Connection) -> list[tuple[Any, str, Any]]:
+  """Every step-finish row this database still holds.
+
+  Newer opencode builds stopped writing step parts altogether and keep the
+  ledger on the session row instead, so an empty part table is expected rather
+  than fatal. Both shapes are returned as step-finish JSON so the caller has one
+  code path.
+  """
+  for table in STEP_PART_TABLES:
+    try:
+      rows = conn.execute(STEP_PART_SQL.format(table=table)).fetchall()
+    except sqlite3.Error:
+      continue
+    if rows:
+      return rows
+  return session_step_rows(conn)
+
+
+def session_step_rows(conn: sqlite3.Connection) -> list[tuple[Any, str, Any]]:
+  """Step-finish rows rebuilt from the per-session counters.
+
+  The session row carries what the session spent (tokens_input, tokens_output,
+  tokens_cache_read, tokens_cache_write, cost). Without dated parts the whole
+  session is attributed to the day it was created, which is the only date the
+  row keeps — the lifetime totals stay exact either way.
+  """
+  try:
+    rows = conn.execute(
+      "SELECT id, time_created, tokens_input, tokens_output, tokens_cache_read,"
+      " tokens_cache_write, cost FROM session_v2"
+    ).fetchall()
+  except sqlite3.Error:
+    return []
+
+  out: list[tuple[Any, str, Any]] = []
+  for session_id, created, input_tokens, output_tokens, cache_read, cache_write, cost in rows:
+    step = {
+      "type": "step-finish",
+      "tokens": {
+        "input": number(input_tokens),
+        "output": number(output_tokens),
+        "cache": {"read": number(cache_read), "write": number(cache_write)},
+      },
+      "cost": cost or 0,
+    }
+    out.append((session_id, json.dumps(step), created))
+  return out
+
+
 def scan_database(today: str, cards: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
   """Per-provider stats from opencode's own tables, or {} when there is none."""
   db = database_path()
@@ -393,7 +447,7 @@ def scan_database(today: str, cards: dict[str, dict[str, Any]]) -> dict[str, dic
       except sqlite3.Error:
         continue
 
-    for session_id, raw, created in conn.execute(STEP_PART_SQL):
+    for session_id, raw, created in step_rows(conn):
       provider_id = providers.get(session_id)
       if not provider_id or not is_tracked(provider_id, cards):
         continue
@@ -465,6 +519,41 @@ def scan_database(today: str, cards: dict[str, dict[str, Any]]) -> dict[str, dic
 # -------------------------------------------------------------------- balance
 
 
+def credential_key(provider_id: str) -> str:
+  """A plain API key from opencode's own credential table.
+
+  Keys entered in opencode's UI live in its database, not in auth.json, so a
+  provider can be signed in and still look unauthenticated to a file-only read.
+  Only key-type credentials qualify: an OAuth access token is not an API key and
+  must not be sent as a bearer to a balance endpoint.
+  """
+  db = database_path()
+  if not db.is_file():
+    return ""
+  conn = None
+  row = None
+  try:
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    row = conn.execute(
+      "SELECT value FROM credential WHERE integration_id = ?"
+      " ORDER BY time_updated DESC LIMIT 1", (provider_id,)
+    ).fetchone()
+  except sqlite3.Error:
+    row = None
+  finally:
+    if conn is not None:
+      conn.close()
+  if not row:
+    return ""
+  try:
+    credential = json.loads(row[0])
+  except (TypeError, ValueError):
+    return ""
+  if not isinstance(credential, dict) or credential.get("type") != "key":
+    return ""
+  return str(credential.get("key") or "").strip()
+
+
 def read_key(provider_id: str, env_var: str, config_name: str) -> str:
   env = str(os.environ.get(env_var, "")).strip()
   if env:
@@ -472,6 +561,9 @@ def read_key(provider_id: str, env_var: str, config_name: str) -> str:
   configured = str(item_config(config_home() / "omarchy" / "agents" / f"{config_name}.json").get("apiKey") or "").strip()
   if configured:
     return configured
+  stored = credential_key(provider_id)
+  if stored:
+    return stored
   entry = read_json(auth_path()).get(provider_id)
   return str(entry.get("key") or "").strip() if isinstance(entry, dict) else ""
 
@@ -631,7 +723,9 @@ def fetch_zen_balance() -> tuple[dict[str, Any] | None, str]:
     })
   except OpencodeError as error:
     # An expired session must never cost the Go card its rolling windows.
-    return None, f"Zen balance unreadable ({error}); refresh sessionCookie"
+    # This endpoint authenticates by browser session alone, so the fix is
+    # always a fresh cookie pasted into the card config, never the API key.
+    return None, f"Zen balance unreadable ({error}); the console needs a fresh sessionCookie"
 
   # "Micro" here is 1e-6 cents, so a dollar is 1e8 of them.
   raw = payload.get("availableMicroCents")

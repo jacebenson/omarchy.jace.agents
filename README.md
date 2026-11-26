@@ -257,8 +257,14 @@ Keys resolve in this order, first hit wins:
 ```
 $DEEPSEEK_API_KEY / $OPENROUTER_API_KEY / $OPENCODE_GO_API_KEY
   -> ~/.config/omarchy/agents/<provider>.json   { "apiKey": "..." }
-    -> opencode's ~/.local/share/opencode/auth.json
+    -> a key-type credential in opencode's own database
+      -> opencode's ~/.local/share/opencode/auth.json
 ```
+
+A key entered through opencode's UI lives in `opencode.db`, not in `auth.json`,
+so reading only the file left DeepSeek and OpenRouter signed in but blank. Both
+sources are read now; OAuth credentials are still skipped here, because an
+access token is not an API key.
 
 So an explicit key needs no code and no UI: it wins over opencode's.
 
@@ -300,9 +306,11 @@ Numbers need `--json`, or they land in `shell.json` as strings:
 omarchy bar set jace.agents refreshIntervalSec 300 --json
 ```
 
-**Row order** is computed, not configured: subscriptions before prepaid accounts
-(same rule as above), each group alphabetical. Use **Move to top / Move to
-bottom** on a card to override it, which writes the plugin's own config:
+**Row order** defaults to subscriptions before prepaid accounts (same rule as
+above), each group alphabetical — but a card you place by hand keeps that
+position across groups, so a prepaid account moved to the top stays on top. Use
+**Move to top / Move to bottom** on a card to place it, which writes the
+plugin's own config:
 
 ```jsonc
 // ~/.config/omarchy/agents/opencode.json

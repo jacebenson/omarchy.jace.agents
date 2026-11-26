@@ -256,34 +256,38 @@ Item {
     hiddenProviders = Array.isArray(hidden) ? hidden.map(String) : []
   }
 
-  // The list reads subscriptions first, then prepaid accounts, each
-  // alphabetically. A subscription is already paid for — not using it wastes
-  // it — while a prepaid balance only ever costs what you spend. So the things
-  // you can lose float to the top.
+  // The default reading order: subscriptions first, then prepaid accounts. A
+  // subscription is already paid for — not using it wastes it — while a prepaid
+  // balance only ever costs what you spend. This is only the fallback for a card
+  // that has never been placed by hand; a stored position wins over it.
   function providerRank(p) {
     if (p.limits && p.limits.length > 0) return 0
     if (p.balance) return 1
     return 2
   }
 
-  // The group is the rule and stays the rule: it is the answer to "which of
-  // these can I lose?", not a default someone should be able to bury. Inside a
-  // group the stored order wins, which is what the move buttons write; anything
-  // unlisted keeps its alphabetical place at the end, so a provider discovered
-  // after the last reorder still appears rather than vanishing.
+  // A stored position is the arrangement, whatever group the card belongs to:
+  // dragging a card to the top is a decision about where it belongs, and a card
+  // you put first must not sink below the subscriptions you did not move.
+  // Providers with no stored position fall back to the group above, then
+  // alphabetically, so one discovered after the last reorder still appears
+  // rather than vanishing.
   function sortProviders(list) {
     var rank = {}
     for (var i = 0; i < providerOrder.length; i++) rank[String(providerOrder[i])] = i
 
     var sorted = list.slice()
     sorted.sort(function(a, b) {
+      var oa = rank[a.providerId]
+      var ob = rank[b.providerId]
+      var placedA = oa !== undefined
+      var placedB = ob !== undefined
+      if (placedA && placedB) return oa - ob
+      if (placedA !== placedB) return placedA ? -1 : 1
+
       var ga = providerRank(a)
       var gb = providerRank(b)
       if (ga !== gb) return ga - gb
-
-      var oa = rank[a.providerId] === undefined ? Number.MAX_SAFE_INTEGER : rank[a.providerId]
-      var ob = rank[b.providerId] === undefined ? Number.MAX_SAFE_INTEGER : rank[b.providerId]
-      if (oa !== ob) return oa - ob
 
       var na = String(a.providerName || a.providerId)
       var nb = String(b.providerName || b.providerId)
