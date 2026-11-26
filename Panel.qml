@@ -24,44 +24,11 @@ Panel {
   readonly property color track: Style.selectedFillFor(foreground, Color.accent)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  // A record being rewritten between reads reports no figure for a moment, and
-  // a card that loses its figure collapses to a mark and comes back — a flash
-  // on a row that never changed. Keep the last figure each provider reported
-  // and draw that until a new one arrives, so the row is never rebuilt empty.
-  property var figureCache: ({})
-
-  readonly property var providers: {
-    var incoming = usage.enabledProviders
-    var held = figureCache
-    var result = []
-    for (var i = 0; i < incoming.length; i++) {
-      var p = incoming[i]
-      var remembered = hasFigure(p) ? null : held[String(p.providerId)]
-      result.push(remembered && hasFigure(remembered) ? remembered : p)
-    }
-    return result
-  }
-
-  function rememberFigures() {
-    var incoming = usage.enabledProviders
-    var next = {}
-    for (var i = 0; i < incoming.length; i++) {
-      var p = incoming[i]
-      var id = String(p.providerId)
-      if (hasFigure(p))
-        next[id] = p
-      else if (figureCache[id])
-        next[id] = figureCache[id]
-    }
-    figureCache = next
-  }
-
-  Connections {
-    target: usage
-    function onDataRevisionChanged() { root.rememberFigures() }
-  }
-
-  Component.onCompleted: rememberFigures()
+  // The list itself stays a plain binding: this property also decides whether
+  // the widget exists at all, and a cache that starts empty hides the bar icon
+  // before it can fill. Holding a provider across a record rewrite happens one
+  // level up, in the usage model, where the records themselves are read.
+  readonly property var providers: usage.enabledProviders
 
   // A card earns a full row by having something to meter: a credit balance or a
   // rolling window. A provider we can spend money on but cannot read — Fireworks
@@ -281,6 +248,11 @@ Panel {
   property var lifetimeProviders: []
   property string lifetimeFetchedAt: ""
   property string lifetimeApplied: ""
+  // Real, not int: the three accounts together pass 2^31 and an int total
+  // would wrap to a small wrong number in the header.
+  property real lifetimeTokens: 0
+  // Which reported provider is open. One at a time, like the cards.
+  property string expandedReport: ""
 
   FileView {
     id: lifetimeFile
@@ -305,44 +277,70 @@ Panel {
     var parsed = null
     try { parsed = JSON.parse(String(content || "")) } catch (e) { parsed = null }
     var entries = parsed && parsed.providers ? parsed.providers : {}
-    var rows = []
     var order = ["deepseek", "openai", "opencode-go"]
+    var total = 0
+    for (var t = 0; t < order.length; t++) {
+      var tallied = entries[order[t]]
+      if (tallied) total += tokenCount(tallied.totalTokens)
+    }
+    var rows = []
     for (var i = 0; i < order.length; i++) {
-      var entry = entries[order[i]]
+      var id = order[i]
+      var entry = entries[id]
       if (!entry) continue
       var tokens = tokenCount(entry.totalTokens)
       var requests = tokenCount(entry.requests)
       var spent = Number(entry.spent || 0)
-      var figure = ""
-      if (tokens > 0) figure += formatTokens(tokens) + " tok"
-      if (requests > 0) figure += (figure === "" ? "" : " · ") + countText(requests) + " req"
-      if (spent > 0) figure += (figure === "" ? "" : " · ") + currencyPrefix(entry.spentCurrency) + spent.toFixed(2)
+      var cacheHits = tokenCount(entry.promptCacheHitTokens)
+      var cacheMisses = tokenCount(entry.promptCacheMissTokens)
+      var output = tokenCount(entry.outputTokens) + tokenCount(entry.responseTokens)
+      var details = []
+      if (requests > 0) details.push({ label: "Requests", value: countText(requests) })
+      if (cacheHits > 0) details.push({ label: "Cache hits", value: formatTokens(cacheHits) })
+      if (cacheMisses > 0) details.push({ label: "Fresh prompt", value: formatTokens(cacheMisses) })
+      if (output > 0) details.push({ label: "Generated", value: formatTokens(output) })
+      if (spent > 0) details.push({ label: "Spent", value: currencyPrefix(entry.spentCurrency) + spent.toFixed(2) })
+      if (Number(entry.credit || 0) > 0) details.push({ label: "Credit left", value: currencyPrefix(entry.currency) + Number(entry.credit).toFixed(2) })
+      if (Number(entry.paidLifetime || 0) > 0) details.push({ label: "Paid to date", value: currencyPrefix(entry.paidCurrency) + Number(entry.paidLifetime).toFixed(2) })
       rows.push({
-        providerId: order[i],
-        name: entryScopeName(order[i]),
+        providerId: id,
+        name: entryShortName(id),
+        scope: entryScopeLabel(entry),
         window: lifetimeWindowText(entry),
-        figure: figure
+        tokens: tokens,
+        requests: requests,
+        spent: spent,
+        currency: String(entry.spentCurrency || "USD"),
+        share: total > 0 ? tokens / total : 0,
+        details: details
       })
     }
-    // Money that is not usage on the same card: what the plan has been paid.
-    // Kept apart from the period's tokens so neither reads as the other.
-    var paid = entries["opencode-go"] && Number(entries["opencode-go"].paidLifetime || 0)
-    if (paid > 0)
-      rows.push({ providerId: "opencode-go-paid", name: "OpenCode Go · paid to date", window: "", figure: currencyPrefix(entries["opencode-go"].paidCurrency) + paid.toFixed(2) })
     root.lifetimeProviders = rows
+    root.lifetimeTokens = total
     root.lifetimeFetchedAt = String(parsed && parsed.fetchedAt ? parsed.fetchedAt : "")
   }
 
-  function entryScopeName(providerId) {
-    if (providerId === "deepseek") return "DeepSeek · lifetime"
-    if (providerId === "openai") return "OpenAI · last 12 months"
-    if (providerId === "opencode-go") return "OpenCode Go · this period"
+  function entryShortName(providerId) {
+    if (providerId === "deepseek") return "DeepSeek"
+    if (providerId === "openai") return "OpenAI"
+    if (providerId === "opencode-go") return "OpenCode Go"
     return providerId
   }
 
+  // The window, as a word: how much of the account the figure actually covers.
+  // Three providers, three answers, and the difference is the whole reason this
+  // block exists instead of one grand total.
+  function entryScopeLabel(entry) {
+    var scope = String(entry && entry.scope ? entry.scope : "")
+    if (scope === "lifetime") return "all time"
+    if (scope === "last-12-months") return "last 12 months"
+    if (scope === "current-period") return "this period"
+    return scope
+  }
+
   function lifetimeWindowText(entry) {
-    var since = String(entry && entry.since ? entry.since : "")
-    var through = String(entry && entry.through ? entry.through : "")
+    var since = String(entry && (entry.since || entry.periodStart) ? (entry.since || entry.periodStart) : "")
+    var through = String(entry && (entry.through || entry.periodEnd) ? (entry.through || entry.periodEnd) : "")
     if (since !== "" && through !== "") return since + " → " + through
     if (since !== "") return "since " + since
     return ""
@@ -1377,15 +1375,17 @@ Panel {
             // What each provider says about itself. This block sits above the
             // local ledger because it is the better number: the rows below can
             // only see sessions opencode recorded here, while this is the
-            // account's own total, windows included in the labels.
+            // account's own total. Each one gets a card with its own window,
+            // because three accounts measure three different spans and a plain
+            // row cannot say that. Click a card to open its breakdown.
             Column {
               id: reportedBlock
               width: parent.width
               visible: root.lifetimeProviders.length > 0
-              spacing: Style.space(2)
+              spacing: Style.space(4)
 
               PanelSectionHeader {
-                text: "Provider-reported"
+                text: "Reported by provider · " + root.formatTokens(root.lifetimeTokens) + " tokens"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
               }
@@ -1393,12 +1393,10 @@ Panel {
               Repeater {
                 model: root.lifetimeProviders
 
-                UsageLine {
+                ProviderReportCard {
                   required property var modelData
                   width: reportedBlock.width
-                  label: modelData.name
-                  figure: modelData.figure
-                  note: modelData.window
+                  report: modelData
                 }
               }
             }
@@ -1611,7 +1609,148 @@ Panel {
     }
   }
 
-  // One labelled figure: the shape the panel's token block and an open card's
+  // One account's own total, as a card you can open. The bar underneath is that
+  // provider's share of everything the three report, which is the comparison a
+  // row of numbers cannot make at a glance.
+  component ProviderReportCard: Item {
+    id: reportCard
+    property var report: null
+    readonly property bool expanded: root.expandedReport === String(report ? report.providerId : "")
+    property bool hovered: false
+
+    width: parent ? parent.width : implicitWidth
+    implicitHeight: cardBody.implicitHeight + Style.space(8) * 2
+    height: implicitHeight
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      color: (reportCard.hovered || reportCard.expanded)
+        ? root.alpha(root.foreground, 0.08)
+        : root.alpha(root.foreground, 0.03)
+      Behavior on color { ColorAnimation { duration: 120 } }
+    }
+
+    HoverHandler {
+      cursorShape: Qt.PointingHandCursor
+      onHoveredChanged: reportCard.hovered = hovered
+    }
+
+    TapHandler {
+      onTapped: {
+        var id = String(reportCard.report ? reportCard.report.providerId : "")
+        root.expandedReport = root.expandedReport === id ? "" : id
+      }
+    }
+
+    Column {
+      id: cardBody
+      width: parent.width - Style.space(8) * 2
+      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(3)
+
+      Item {
+        width: parent.width
+        height: Math.max(nameColumn.implicitHeight, totalText.implicitHeight)
+
+        Column {
+          id: nameColumn
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          width: Math.max(0, parent.width - totalText.width - Style.spacing.md)
+          spacing: 0
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            elide: Text.ElideRight
+            text: reportCard.report ? String(reportCard.report.name) : ""
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption * 1.15
+            font.bold: true
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            elide: Text.ElideRight
+            text: {
+              var r = reportCard.report
+              if (!r) return ""
+              var bits = [String(r.scope)]
+              if (String(r.window) !== "") bits.push(String(r.window))
+              return bits.join(" · ")
+            }
+            color: root.dim
+            opacity: 0.85
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        Text {
+          id: totalText
+          textFormat: Text.PlainText
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          text: reportCard.report ? root.formatTokens(reportCard.report.tokens) : ""
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption * 1.5
+          font.bold: true
+        }
+      }
+
+      // The share bar: this account against the others that report a total.
+      Rectangle {
+        width: parent.width
+        height: Math.max(3, Style.space(1))
+        radius: height / 2
+        color: root.alpha(root.foreground, 0.10)
+
+        Rectangle {
+          width: parent.width * Math.max(0, Math.min(1, reportCard.report ? Number(reportCard.report.share) : 0))
+          height: parent.height
+          radius: parent.radius
+          color: root.track
+          Behavior on width { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
+        }
+      }
+
+      // What the figure on the card is made of. Only drawn when the card is
+      // open: closed cards stay a comparison, open ones become a receipt.
+      Column {
+        width: parent.width
+        visible: reportCard.expanded
+        spacing: Style.space(2)
+
+        PanelSeparator { foreground: root.foreground }
+
+        Repeater {
+          model: (reportCard.report && reportCard.expanded) ? reportCard.report.details : []
+
+          UsageLine {
+            required property var modelData
+            width: parent.width
+            label: String(modelData.label)
+            figure: String(modelData.value)
+          }
+        }
+
+        UsageLine {
+          width: parent.width
+          label: "Open console"
+          figure: "↗"
+          interactive: true
+          onActivated: root.openUrl(root.billingUrl(String(reportCard.report ? reportCard.report.providerId : "")))
+        }
+      }
+    }
+  }
+
+  // One labelled figure. The token block, the counts block and the card's own
   // usage section both draw. Anchored rather than a Row for the same reason the
   // window lines are — the label elides against the figure, and the two share a
   // baseline without a positioner having to decide it.
@@ -1621,6 +1760,22 @@ Panel {
     property string figure: ""
     // The one line that is a sum of the others, wherever it is drawn.
     property bool emphasized: false
+    // A line that does something when clicked. The label lifts on hover rather
+    // than the whole row wearing a button, so a list of figures stays a list.
+    property bool interactive: false
+    property bool hovered: false
+    signal activated()
+
+    HoverHandler {
+      enabled: usageLine.interactive
+      cursorShape: Qt.PointingHandCursor
+      onHoveredChanged: usageLine.hovered = hovered
+    }
+
+    TapHandler {
+      enabled: usageLine.interactive
+      onTapped: usageLine.activated()
+    }
     // The window behind a figure, when the figure does not cover everything.
     // It is a second line rather than part of the label so the number stays
     // readable and the caveat stays attached to it.
@@ -1642,7 +1797,8 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         width: usageRow.width - usageFigure.width - Style.spacing.md
         text: usageLine.label
-        color: root.dim
+        color: usageLine.interactive && usageLine.hovered ? root.foreground : root.dim
+        Behavior on color { ColorAnimation { duration: 100 } }
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         font.bold: usageLine.emphasized

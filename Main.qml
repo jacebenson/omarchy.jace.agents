@@ -200,6 +200,15 @@ Item {
   // settings and having actually produced numbers — locally or on a synced
   // device. With nothing to show, the whole module collapses out of the bar
   // rather than sitting there dimmed.
+
+  // A record is rewritten whole, and between the two reads the provider has no
+  // figures — so it drops out of this list for a frame and its card collapses
+  // to a mark and comes back. Hold the last list across one revision and let a
+  // provider that is still on disk stay on screen with what it last reported.
+  // Once its record file is gone the hold is dropped on the next pass, so this
+  // is a bridge over a rewrite, not a cache that keeps dead rows alive.
+  property var heldProviders: []
+
   property var enabledProviders: {
     var rev = dataRevision
     var syncRev = syncRevision
@@ -224,8 +233,43 @@ Item {
       var syncedDisplay = displayProvider({ id: syncedId, name: stats.providerName || syncedId })
       if (providerHasData(syncedDisplay)) result.push(syncedDisplay)
     }
+    var held = heldProviders
+    if (held.length > 0) {
+      var shown = {}
+      for (var s = 0; s < result.length; s++) shown[String(result[s].providerId)] = true
+      for (var h = 0; h < held.length; h++) {
+        var previous = held[h]
+        var previousId = String(previous.providerId)
+        if (shown[previousId] || !localIds[previousId] || !providerEnabled(previousId)) continue
+        result.push(previous)
+      }
+    }
     return sortProviders(result)
   }
+
+  // Refreshed once per revision, after the list above has been read: everything
+  // currently drawn whose record still exists becomes the next hold.
+  function holdProviders() {
+    var live = {}
+    for (var i = 0; i < agents.length; i++) {
+      var record = agents[i] ? agents[i].record : null
+      if (record && record.id) live[String(record.id)] = true
+    }
+    var current = enabledProviders
+    var next = []
+    for (var j = 0; j < current.length; j++)
+      if (live[String(current[j].providerId)]) next.push(current[j])
+    heldProviders = next
+  }
+
+  Connections {
+    target: root
+    function onDataRevisionChanged() { root.holdProviders() }
+  }
+
+  // The hold is only needed once a revision has been seen, so it is filled by the
+  // handler above rather than at completion: an empty hold on the first frame is
+  // the correct state.
 
   // The plugin's own config, which the collector writes. It holds which
   // providers are switched off and the order the cards are drawn in. Reading it
